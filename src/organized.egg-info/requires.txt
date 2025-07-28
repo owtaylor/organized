@@ -1,0 +1,3 @@
+beeai
+fastapi
+uvicorn
