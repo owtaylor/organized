@@ -10,9 +10,11 @@ The primary goal is to build a personal organization application to manage notes
 
 -   `src/`: Contains the core Python codebase for the backend server and agentic workflows.
     -   `organized/main.py`: The main FastAPI application file.
--   `ui/`: Contains the React/TypeScript frontend application.
+-   `ui/`: Contains the React/TypeScript frontend application, built with Vite and styled with Tailwind CSS.
+    - `vite.config.ts`: Vite configuration file.
+    - `tailwind.config.js`: Tailwind CSS configuration file.
+    - `package.json`: Defines the Node.js project dependencies and scripts for the UI.
 -   `pyproject.toml`: Defines the Python project dependencies and configuration. Managed by `uv`.
--   `package.json`: Defines the Node.js project dependencies and scripts for the UI.
 -   `~/.local/share/organized/main`: The default location for the local git repository that stores the user's data (`TASKS.md`).
 -   `~/.config/organized/config.yaml`: The location for the application's configuration, including API keys.
 
@@ -41,9 +43,28 @@ Description of the major task.
 ## Key Technologies
 
 -   **Backend:** Python with FastAPI.
--   **Frontend:** React with TypeScript.
+-   **Frontend:** React with TypeScript, Vite, and Tailwind CSS.
 -   **Python Package Manager:** `uv`
 -   **Markdown Editor:** MDXEditor
 -   **Agent Framework:** BeeAI
 -   **Data Sync:** `rclone` for syncing audio notes from Google Drive.
 -   **Version Control:** Git is used to track changes to the data files.
+
+## Development
+
+To run the application, you need to start both the backend and frontend servers.
+
+### Backend
+
+Navigate to the project root and run:
+```bash
+uvicorn organized.main:app --reload
+```
+
+### Frontend
+
+Navigate to the `ui` directory and run:
+```bash
+npm run dev
+```
+The UI will be available at `http://localhost:5173` by default.
