@@ -5,6 +5,7 @@ dependencies = [
     "beeai",
     "fastapi",
     "uvicorn",
+    "pyyaml",
 ]
 
 [tool.setuptools.packages.find]

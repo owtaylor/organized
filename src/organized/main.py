@@ -1,4 +1,5 @@
 import subprocess
+import yaml
 from fastapi import FastAPI, Request
 from fastapi.responses import PlainTextResponse
 from pathlib import Path
@@ -7,6 +8,16 @@ app = FastAPI()
 
 GIT_CHECKOUT_LOCATION = Path.home() / ".local" / "share" / "organized" / "main"
 TASKS_FILE_PATH = GIT_CHECKOUT_LOCATION / "TASKS.md"
+
+def extract_frontmatter(content):
+    """
+    Extracts YAML frontmatter from the content.
+    """
+    if content.startswith("---"):
+        parts = content.split("---", 2)
+        if len(parts) >= 3:
+            return yaml.safe_load(parts[1]), parts[2].lstrip()
+    return {}, content
 
 @app.on_event("startup")
 async def startup_event():
@@ -58,15 +69,25 @@ This is the description of the major task.
 
 - [ ] ⏫ This is a random import task not related to any project
 """
-    return TASKS_FILE_PATH.read_text()
+    
+    _, content = extract_frontmatter(TASKS_FILE_PATH.read_text())
+    return content
 
 @app.post("/api/files/TASKS.md")
 async def update_tasks_file(request: Request):
     """
     Writes content to TASKS.md in the git repository.
     """
-    content = await request.body()
-    TASKS_FILE_PATH.write_text(content.decode())
+    new_content = (await request.body()).decode()
+    
+    existing_frontmatter = {}
+    if TASKS_FILE_PATH.exists():
+        existing_frontmatter, _ = extract_frontmatter(TASKS_FILE_PATH.read_text())
+    
+    if existing_frontmatter:
+        new_content = "---\n" + yaml.dump(existing_frontmatter) + "---\n\n" + new_content
+
+    TASKS_FILE_PATH.write_text(new_content)
     return {"message": "File updated successfully"}
 
 if __name__ == "__main__":
