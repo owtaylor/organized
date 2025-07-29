@@ -10,17 +10,25 @@ import {
   UndoRedo,
   BoldItalicUnderlineToggles,
   ListsToggle,
+  diffSourcePlugin,
+  DiffSourceToggleWrapper,
 } from "@mdxeditor/editor";
 import "@mdxeditor/editor/style.css";
 import { FC } from "react";
 
 interface EditorProps {
   markdown: string;
+  diffMarkdown: string;
   editorRef?: React.MutableRefObject<MDXEditorMethods | null>;
   onChange?: (markdown: string) => void;
 }
 
-const Editor: FC<EditorProps> = ({ markdown, editorRef, onChange }) => {
+const Editor: FC<EditorProps> = ({
+  markdown,
+  diffMarkdown,
+  editorRef,
+  onChange,
+}) => {
   return (
     <MDXEditor
       className="prose"
@@ -33,13 +41,17 @@ const Editor: FC<EditorProps> = ({ markdown, editorRef, onChange }) => {
         quotePlugin(),
         thematicBreakPlugin(),
         markdownShortcutPlugin(),
+        diffSourcePlugin({
+          diffMarkdown: diffMarkdown,
+          viewMode: "rich-text",
+        }),
         toolbarPlugin({
           toolbarContents: () => (
-            <>
-              <UndoRedo />
+            <DiffSourceToggleWrapper>
               <BoldItalicUnderlineToggles />
               <ListsToggle />
-            </>
+              <UndoRedo />
+            </DiffSourceToggleWrapper>
           ),
         }),
       ]}

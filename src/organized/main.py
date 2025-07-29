@@ -31,7 +31,7 @@ async def startup_event():
         subprocess.run(["git", "init"], cwd=GIT_CHECKOUT_LOCATION, check=True)
 
 @app.get("/api/files/TASKS.md", response_class=PlainTextResponse)
-async def get_tasks_file():
+async def get_tasks_file(committed: bool = False):
     """
     Reads the content of TASKS.md from the git repository.
     """
@@ -69,8 +69,23 @@ This is the description of the major task.
 
 - [ ] ⏫ This is a random import task not related to any project
 """
-    
-    _, content = extract_frontmatter(TASKS_FILE_PATH.read_text())
+
+    if committed:
+        try:
+            content = subprocess.run(
+                ["git", "show", "HEAD:TASKS.md"],
+                cwd=GIT_CHECKOUT_LOCATION,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout
+        except subprocess.CalledProcessError:
+            # Handle case where file doesn't exist in git history
+            return ""
+    else:
+        content = TASKS_FILE_PATH.read_text()
+
+    _, content = extract_frontmatter(content)
     return content
 
 @app.post("/api/files/TASKS.md")

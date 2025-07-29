@@ -7,14 +7,20 @@ import { type MDXEditorMethods } from "@mdxeditor/editor";
 function App() {
   const editorRef = useRef<MDXEditorMethods | null>(null);
   const timeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const [markdown, setMarkdown] = useState("");
+  const [committedMarkdown, setCommittedMarkdown] = useState("");
 
   useEffect(() => {
     const fetchTasks = async () => {
       try {
-        const response = await fetch("/api/files/TASKS.md");
-        const data = await response.text();
-        console.log("tasks.md", data);
-        editorRef.current?.setMarkdown(data);
+        const [workingResponse, committedResponse] = await Promise.all([
+          fetch("/api/files/TASKS.md"),
+          fetch("/api/files/TASKS.md?committed=true"),
+        ]);
+        const workingData = await workingResponse.text();
+        const committedData = await committedResponse.text();
+        setMarkdown(workingData);
+        setCommittedMarkdown(committedData);
       } catch (error) {
         console.error("Error fetching tasks:", error);
         toast.error("Failed to fetch tasks.");
@@ -22,10 +28,17 @@ function App() {
     };
 
     fetchTasks();
-  }, [editorRef]);
+  }, []);
+
+  useEffect(() => {
+    if (editorRef.current) {
+      console.log("MD:", markdown);
+      editorRef.current.setMarkdown(markdown);
+    }
+  }, [markdown, editorRef]);
 
   const handleEditorChange = (newMarkdown: string) => {
-    console.log("handleEditorChange", newMarkdown);
+    setMarkdown(newMarkdown);
     if (timeoutRef.current) {
       clearTimeout(timeoutRef.current);
     }
@@ -53,7 +66,8 @@ function App() {
         <div className="w-3/4 p-4">
           <Editor
             editorRef={editorRef}
-            markdown=""
+            markdown={markdown}
+            diffMarkdown={committedMarkdown}
             onChange={handleEditorChange}
           />
         </div>
