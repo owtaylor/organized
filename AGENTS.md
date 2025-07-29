@@ -68,3 +68,15 @@ Navigate to the `ui` directory and run:
 npm run dev
 ```
 The UI will be available at `http://localhost:5173` by default.
+
+### Code Formatting
+
+To reformat Python code, run the following command from the project root:
+```bash
+uv run ruff check --fix
+```
+
+To reformat frontend code, navigate to the `ui/` directory and run:
+```bash
+npm run prettier-write
+```
