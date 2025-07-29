@@ -9,15 +9,15 @@ import {
   toolbarPlugin,
   UndoRedo,
   BoldItalicUnderlineToggles,
-  ListsToggle
-} from '@mdxeditor/editor'
+  ListsToggle,
+} from "@mdxeditor/editor";
 import "@mdxeditor/editor/style.css";
-import { FC } from 'react'
+import { FC } from "react";
 
 interface EditorProps {
-  markdown: string
-  editorRef?: React.MutableRefObject<MDXEditorMethods | null>
-  onChange?: (markdown: string) => void
+  markdown: string;
+  editorRef?: React.MutableRefObject<MDXEditorMethods | null>;
+  onChange?: (markdown: string) => void;
 }
 
 const Editor: FC<EditorProps> = ({ markdown, editorRef, onChange }) => {
@@ -40,11 +40,11 @@ const Editor: FC<EditorProps> = ({ markdown, editorRef, onChange }) => {
               <BoldItalicUnderlineToggles />
               <ListsToggle />
             </>
-          )
-        })
+          ),
+        }),
       ]}
     />
-  )
-}
+  );
+};
 
 export default Editor;
