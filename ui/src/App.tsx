@@ -63,7 +63,7 @@ function App() {
     <>
       <Toaster />
       <div className="flex h-screen">
-        <div className="w-3/4 p-4">
+        <div className="w-3/4 overflow-y-auto p-4">
           <Editor
             editorRef={editorRef}
             markdown={markdown}
@@ -71,7 +71,7 @@ function App() {
             onChange={handleEditorChange}
           />
         </div>
-        <div className="w-1/4 border-l">
+        <div className="w-1/4 overflow-y-auto border-l">
           <Chat />
         </div>
       </div>
