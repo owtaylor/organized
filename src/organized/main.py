@@ -1,6 +1,5 @@
-import os
 import subprocess
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, Request
 from fastapi.responses import PlainTextResponse
 from pathlib import Path
 
