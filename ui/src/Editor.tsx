@@ -12,6 +12,9 @@ import {
   ListsToggle,
   diffSourcePlugin,
   DiffSourceToggleWrapper,
+  linkPlugin,
+  linkDialogPlugin,
+  CreateLink,
 } from "@mdxeditor/editor";
 import "@mdxeditor/editor/style.css";
 import { FC } from "react";
@@ -37,6 +40,8 @@ const Editor: FC<EditorProps> = ({
       onChange={onChange}
       plugins={[
         headingsPlugin(),
+        linkDialogPlugin(),
+        linkPlugin(),
         listsPlugin(),
         quotePlugin(),
         thematicBreakPlugin(),
@@ -50,6 +55,7 @@ const Editor: FC<EditorProps> = ({
             <DiffSourceToggleWrapper>
               <BoldItalicUnderlineToggles />
               <ListsToggle />
+              <CreateLink />
               <UndoRedo />
             </DiffSourceToggleWrapper>
           ),
