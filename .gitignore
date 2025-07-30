@@ -22,3 +22,4 @@ build/
 .idea/
 *.swp
 *~
+src/organized.egg-info/
