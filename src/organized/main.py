@@ -4,10 +4,13 @@ from fastapi import FastAPI, Request
 from fastapi.responses import PlainTextResponse
 from pathlib import Path
 
+from . import notes
+
 app = FastAPI()
 
 GIT_CHECKOUT_LOCATION = Path.home() / ".local" / "share" / "organized" / "main"
 TASKS_FILE_PATH = GIT_CHECKOUT_LOCATION / "TASKS.md"
+
 
 def extract_frontmatter(content):
     """
@@ -19,6 +22,7 @@ def extract_frontmatter(content):
             return yaml.safe_load(parts[1]), parts[2].lstrip()
     return {}, content
 
+
 @app.on_event("startup")
 async def startup_event():
     """
@@ -29,6 +33,7 @@ async def startup_event():
 
     if not (GIT_CHECKOUT_LOCATION / ".git").exists():
         subprocess.run(["git", "init"], cwd=GIT_CHECKOUT_LOCATION, check=True)
+
 
 @app.get("/api/files/TASKS.md", response_class=PlainTextResponse)
 async def get_tasks_file(committed: bool = False):
@@ -88,23 +93,43 @@ This is the description of the major task.
     _, content = extract_frontmatter(content)
     return content
 
+
 @app.post("/api/files/TASKS.md")
 async def update_tasks_file(request: Request):
     """
     Writes content to TASKS.md in the git repository.
     """
     new_content = (await request.body()).decode()
-    
+
     existing_frontmatter = {}
     if TASKS_FILE_PATH.exists():
         existing_frontmatter, _ = extract_frontmatter(TASKS_FILE_PATH.read_text())
-    
+
     if existing_frontmatter:
-        new_content = "---\n" + yaml.dump(existing_frontmatter) + "---\n\n" + new_content
+        new_content = (
+            "---\n" + yaml.dump(existing_frontmatter) + "---\n\n" + new_content
+        )
 
     TASKS_FILE_PATH.write_text(new_content)
     return {"message": "File updated successfully"}
 
+
+@app.get("/api/notes/list")
+async def list_notes():
+    return notes.get_notes_list()
+
+
+@app.get("/api/notes/sync")
+async def sync_notes():
+    return await notes.sync_notes()
+
+
+@app.get("/api/notes/{note_hash}", response_class=PlainTextResponse)
+async def get_note(note_hash: str):
+    return notes.get_note_by_hash(note_hash)
+
+
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run(app, host="0.0.0.0", port=8000)

@@ -42,7 +42,7 @@ config.yaml:
 
 ```yaml
 audio_notes:
-  folder_name: "organized/Audio Notes"
+  sync_command: "rclone sync gdrive:AudioNotes $dest"
 gemini:
   api_key: "your_api_key_here"
 github:
@@ -98,3 +98,51 @@ This is the description of the major task.
 
 - [ ] ⏫ This is a random import task not related to any project
 ```
+
+## Audio Notes 
+
+### Audio notes backend
+
+* Audio notes are stored at ~/.local/share/organized/audio/
+* This is synchronized from remote storage using audio_notes: sync_command from the config file. The filenames are whatever they are in the origin.
+* The notes are transcribed into the notes/ folder in the repository. Files are named with the timestamp the audio was recorded in the format 2025-07-13-17:21:18.md
+* Transcription is done by calling gemini. If present, a file in the repository ./CONTEXT.md is provided as context for the transcription - it is a markdown file that has information like names of people and names of projects.
+* The date is extracted from the file by calling out to the mediainfo tool. As a shell command the extraction looks like:
+
+       $ mediainfo --Output=JSON /path/to/file.m4a  | jq .media.track[0].Encoded_Date
+       "2025-07-28 20:08:15 UTC"
+
+  But the extraction from the JSON should be done in the code rather than using jq.
+
+* The repository also has a notes.yaml file that looks like:
+
+      - hash: 1234567890abcdef
+        date: 2025-07-13-17:21:18
+        title: Work on my project
+        processed: false
+
+  the hash field is the sha256sum of the audio file.
+  the processed field indicates that the note has been processed by the agent and the TASKS.md file updated accordingly.
+
+* There are the following routes in the API:
+    GET /api/notes/list - returns the list of notes (notes.yaml in JSON form)
+    GET /api/notes/<hash> - returns the transcribed note for the given hash
+    GET /api/notes/sync. This does the following:
+    - calls sync_command to sync the notes from the remote server
+    - updates notes.yaml with the new notes. the title field is not yet provided.
+    - for each note in notes.yaml (whether downloaded or not), if there is no transcription
+      - calls out to gemini to transcribe the note
+      - writes the transcription file
+      - uses the first heading of the transcription as the title of the note (the transcription prompt should the model to add a toplevel heading with a brief summary of the contents of the note)
+
+### Audio notes frontend design
+
+The page should be updated so there are two tabs on the left (the chat window on the right is always shown) - one tab is "Tasks" with the current UI for the TASKS.md and one tab is "Notes" with the following UI: there is a list of notes on the left, and the transcription of the selected note on the right.
+
+The list of notes is sorted by date, with the most recent note at the top. The list of notes should show the title of the note, and the date of the note.
+
+The transcription is shown as rendered markdown. It is not editable - use remarkjs/react-markdown (new dependency) to render it.
+
+A toolbar is added above the chat interface, it currently has only a single button in it, which is "Sync Notes", and when triggered runs /api/notes/sync.
+
+

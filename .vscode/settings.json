@@ -4,5 +4,6 @@
       "editor.defaultFormatter": "charliermarsh.ruff"
    },
   "editor.defaultFormatter": "esbenp.prettier-vscode",
-  "prettier.prettierPath": "ui/node_modules/prettier"
+"prettier.prettierPath": "ui/node_modules/prettier",
+"python-envs.pythonProjects": []
 }
