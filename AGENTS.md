@@ -52,22 +52,9 @@ Description of the major task.
 
 ## Development
 
-To run the application, you need to start both the backend and frontend servers.
+### Running the app
 
-### Backend
-
-Navigate to the project root and run:
-```bash
-uvicorn organized.main:app --reload
-```
-
-### Frontend
-
-Navigate to the `ui` directory and run:
-```bash
-npm run dev
-```
-The UI will be available at `http://localhost:5173` by default.
+*Do not* attempt to start backend or frontend servers after making changes - assume that the user is running them separately
 
 ### Code Formatting
 

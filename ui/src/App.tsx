@@ -1,14 +1,18 @@
 import { useEffect, useRef, useState } from "react";
 import Editor from "./Editor";
 import Chat from "./Chat";
+import Notes from "./Notes";
 import { Toaster, toast } from "react-hot-toast";
 import { type MDXEditorMethods } from "@mdxeditor/editor";
+
+type Tab = "tasks" | "notes";
 
 function App() {
   const editorRef = useRef<MDXEditorMethods | null>(null);
   const timeoutRef = useRef<NodeJS.Timeout | null>(null);
   const [markdown, setMarkdown] = useState("");
   const [committedMarkdown, setCommittedMarkdown] = useState("");
+  const [activeTab, setActiveTab] = useState<Tab>("tasks");
 
   useEffect(() => {
     const fetchTasks = async () => {
@@ -31,11 +35,10 @@ function App() {
   }, []);
 
   useEffect(() => {
-    if (editorRef.current) {
-      console.log("MD:", markdown);
+    if (activeTab === "tasks" && editorRef.current) {
       editorRef.current.setMarkdown(markdown);
     }
-  }, [markdown, editorRef]);
+  }, [markdown, activeTab, editorRef]);
 
   const handleEditorChange = (newMarkdown: string) => {
     setMarkdown(newMarkdown);
@@ -63,16 +66,44 @@ function App() {
     <>
       <Toaster />
       <div className="flex h-screen">
-        <div className="w-3/4 overflow-y-auto p-4">
-          <Editor
-            editorRef={editorRef}
-            markdown={markdown}
-            diffMarkdown={committedMarkdown}
-            onChange={handleEditorChange}
-          />
+        <div className="flex w-3/4 flex-col">
+          <div className="flex border-b">
+            <button
+              className={`px-4 py-2 ${
+                activeTab === "tasks" ? "border-b-2 border-blue-500" : ""
+              }`}
+              onClick={() => setActiveTab("tasks")}
+            >
+              Tasks
+            </button>
+            <button
+              className={`px-4 py-2 ${
+                activeTab === "notes" ? "border-b-2 border-blue-500" : ""
+              }`}
+              onClick={() => setActiveTab("notes")}
+            >
+              Notes
+            </button>
+          </div>
+          <div className="flex-grow overflow-y-auto">
+            {activeTab === "tasks" ? (
+              <div className="p-4">
+                <Editor
+                  editorRef={editorRef}
+                  markdown={markdown}
+                  diffMarkdown={committedMarkdown}
+                  onChange={handleEditorChange}
+                />
+              </div>
+            ) : (
+              <Notes />
+            )}
+          </div>
         </div>
-        <div className="w-1/4 overflow-y-auto border-l">
-          <Chat />
+        <div className="flex w-1/4 flex-col border-l">
+          <div className="flex-grow overflow-y-auto">
+            <Chat />
+          </div>
         </div>
       </div>
     </>

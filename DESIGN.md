@@ -143,6 +143,6 @@ The list of notes is sorted by date, with the most recent note at the top. The l
 
 The transcription is shown as rendered markdown. It is not editable - use remarkjs/react-markdown (new dependency) to render it.
 
-A toolbar is added above the chat interface, it currently has only a single button in it, which is "Sync Notes", and when triggered runs /api/notes/sync.
+A floating action button is overlayed at the lower right of the notes list (so only visible when you go to the notes tab). It uses the arrow-path heroicon and when triggered runs /api/notes/sync.
 
 
