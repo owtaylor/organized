@@ -8,19 +8,18 @@ from pathlib import Path
 from typing import List, Dict, Any, Optional
 from pydantic import BaseModel
 
-import google.generativeai as genai
 import yaml
 from fastapi import HTTPException
 
+from .config import get_config
+from .gemini_utils import get_genai_client
+
 # --- Configuration ---
-CONFIG_PATH = Path.home() / ".config" / "organized" / "config.yaml"
 GIT_CHECKOUT_LOCATION = Path.home() / ".local" / "share" / "organized" / "main"
 AUDIO_NOTES_DIR = Path.home() / ".local" / "share" / "organized" / "audio"
 NOTES_DIR = GIT_CHECKOUT_LOCATION / "notes"
 NOTES_METADATA_PATH = GIT_CHECKOUT_LOCATION / "notes.yaml"
 CONTEXT_FILE_PATH = GIT_CHECKOUT_LOCATION / "CONTEXT.md"
-
-logging.basicConfig(level=logging.INFO)
 
 
 # --- Data Models ---
@@ -32,13 +31,6 @@ class Note(BaseModel):
 
 
 # --- Helper Functions ---
-
-
-def get_config():
-    """Loads the configuration from config.yaml."""
-    if not CONFIG_PATH.exists():
-        raise HTTPException(status_code=500, detail="Config file not found")
-    return yaml.safe_load(CONFIG_PATH.read_text())
 
 
 def get_note_metadata() -> List[Dict[str, Any]]:
@@ -84,13 +76,6 @@ def get_audio_file_date(file_path: Path) -> str:
 
 async def transcribe_audio(file_path: Path) -> str:
     """Transcribes an audio file using the Gemini API."""
-    config = get_config()
-    api_key = config.get("gemini", {}).get("api_key")
-    if not api_key:
-        raise HTTPException(status_code=500, detail="Gemini API key not found")
-
-    genai.configure(api_key=api_key)
-    model = genai.GenerativeModel("models/gemini-1.5-flash")
 
     context = ""
     if CONTEXT_FILE_PATH.exists():
@@ -111,11 +96,18 @@ The transcription should start with a toplevel heading with a brief summary
 of the contents of the note, and when I change topic, add a section header.
 {context}
 """
-    audio_file = genai.upload_file(path=str(file_path))
+    client = get_genai_client()
+    audio_file = client.files.upload(file=str(file_path))
     logging.info(f"Requesting transcription for {file_path.name}")
-    response = await model.generate_content_async([prompt, audio_file])
+    response = client.models.generate_content(
+        model="gemini-1.5-flash", contents=[prompt, audio_file]
+    )
     logging.info(f"Transcription complete for {file_path.name}")
     logging.info(f"Usage metadata: {response.usage_metadata}")
+
+    if response.text is None:
+        raise RuntimeError("No transcription returned")
+
     return response.text
 
 
