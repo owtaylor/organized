@@ -87,19 +87,24 @@ async def get_chat_history(agent: OrganizedAgent = Depends(get_agent)):
 
         # Extract only user messages and final assistant responses
         history = []
-        
+
         for msg in messages:
-            if str(msg.role) == 'user':
+            if str(msg.role) == "user":
                 history.append({"role": "user", "content": msg.text})
-            elif str(msg.role) == 'assistant':
+            elif str(msg.role) == "assistant":
                 # Look for final_answer tool calls
                 for content_item in msg.content:
-                    if isinstance(content_item, MessageToolCallContent) and content_item.tool_name == 'final_answer':
+                    if (
+                        isinstance(content_item, MessageToolCallContent)
+                        and content_item.tool_name == "final_answer"
+                    ):
                         try:
                             args = json.loads(content_item.args)
-                            response = args.get('response', '')
+                            response = args.get("response", "")
                             if response:
-                                history.append({"role": "assistant", "content": response})
+                                history.append(
+                                    {"role": "assistant", "content": response}
+                                )
                         except:
                             pass
 
@@ -125,7 +130,7 @@ async def clear_chat(agent: OrganizedAgent = Depends(get_agent)):
     """
     try:
         # Clear the agent's memory
-        await agent.memory.clear()
+        agent.memory.reset()
 
         return {"message": "Chat history cleared successfully"}
 
