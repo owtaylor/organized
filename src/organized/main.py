@@ -2,9 +2,13 @@ from fastapi import FastAPI, Request
 from fastapi.responses import PlainTextResponse
 
 from . import notes
+from .chat import router as chat_router
 from .tasks import ensure_git_repo, read_tasks_file, write_tasks_file
 
 app = FastAPI()
+
+# Include chat router
+app.include_router(chat_router)
 
 
 @app.on_event("startup")

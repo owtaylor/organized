@@ -8,6 +8,7 @@ dependencies = [
     "pyyaml",
     "pydantic",
     "google-genai>=1.29.0",
+    "beeai-framework>=0.1.36",
 ]
 
 [tool.setuptools.packages.find]
