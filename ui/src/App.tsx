@@ -3,12 +3,10 @@ import Editor from "./Editor";
 import Chat from "./Chat";
 import Notes from "./Notes";
 import { Toaster, toast } from "react-hot-toast";
-import { type MDXEditorMethods } from "@mdxeditor/editor";
 
 type Tab = "tasks" | "notes";
 
 function App() {
-  const editorRef = useRef<MDXEditorMethods | null>(null);
   const timeoutRef = useRef<NodeJS.Timeout | null>(null);
   const [markdown, setMarkdown] = useState("");
   const [committedMarkdown, setCommittedMarkdown] = useState("");
@@ -34,11 +32,6 @@ function App() {
     fetchTasks();
   }, []);
 
-  useEffect(() => {
-    if (activeTab === "tasks" && editorRef.current) {
-      editorRef.current.setMarkdown(markdown);
-    }
-  }, [markdown, activeTab, editorRef]);
 
   const handleEditorChange = (newMarkdown: string) => {
     setMarkdown(newMarkdown);
@@ -87,9 +80,8 @@ function App() {
           </div>
           <div className="flex-grow overflow-y-auto">
             {activeTab === "tasks" ? (
-              <div className="p-4">
+              <div className="p-4 h-full">
                 <Editor
-                  editorRef={editorRef}
                   markdown={markdown}
                   diffMarkdown={committedMarkdown}
                   onChange={handleEditorChange}
