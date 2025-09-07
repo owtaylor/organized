@@ -7,11 +7,15 @@ as specified in FILESYSTEM_DESIGN.md.
 """
 
 import abc
+import asyncio
 import os
 import tempfile
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Callable
+from typing import Dict, List, Optional, Callable, AsyncIterator
+
+from watchfiles import awatch, Change
 
 
 @dataclass
@@ -316,3 +320,127 @@ class FileSystem:
         for watcher in self.watchers:
             if watcher != exclude_watcher:
                 watcher.on_file_change(filename, content)
+
+    @asynccontextmanager
+    async def watch_files(self) -> AsyncIterator[None]:
+        """
+        Async context manager for watching file changes.
+
+        Usage:
+            async with filesystem.watch_files():
+                # File changes will be automatically detected and processed
+                await some_other_work()
+        """
+
+        async def _watch_files() -> None:
+            try:
+                async for changes in awatch(self.repository_path):
+                    for change_type, file_path_str in changes:
+                        await self._handle_file_change(change_type, Path(file_path_str))
+            except asyncio.CancelledError:
+                # Expected when stopping the watcher
+                pass
+
+        watch_task = asyncio.create_task(_watch_files())
+        try:
+            # This gives _watch_files() the chance to run until the point awatch()
+            # has set up the necessary inotify watches and suspends itself to wait
+            # for events.
+            # https://github.com/samuelcolvin/watchfiles/issues/350
+            await asyncio.sleep(0)
+            yield
+        finally:
+            watch_task.cancel()
+            try:
+                await watch_task
+            except asyncio.CancelledError:
+                pass
+
+    async def _handle_file_change(self, change_type: Change, file_path: Path) -> None:
+        """
+        Handle a single file change event.
+
+        Args:
+            change_type: The type of change (added, modified, deleted)
+            file_path: Absolute path to the changed file
+        """
+        try:
+            # Convert absolute path to relative path within repository
+            try:
+                relative_path = file_path.relative_to(self.repository_path)
+                filename = str(relative_path)
+            except ValueError:
+                # File is outside repository, ignore
+                return
+
+            # Skip .git directory changes
+            if filename.startswith(".git/") or filename == ".git":
+                return
+
+            # Only process files that are currently being tracked
+            if filename not in self.files:
+                return
+
+            if change_type == Change.deleted:
+                # File was deleted
+                await self._handle_file_deletion(filename)
+            elif change_type in (Change.added, Change.modified):
+                # File was added or modified
+                await self._handle_file_modification(filename, file_path)
+
+        except Exception as e:
+            # Log error but continue processing other changes
+            print(f"Error handling file change for {file_path}: {e}")
+
+    async def _handle_file_deletion(self, filename: str) -> None:
+        """
+        Handle deletion of a tracked file.
+
+        Args:
+            filename: Relative path of the deleted file
+        """
+        if filename in self.files:
+            # File was deleted externally, update our tracking
+            # For now, we'll just remove it from tracking
+            # In the future, this might need more sophisticated handling
+            del self.files[filename]
+
+            # Notify watchers that the file was deleted (with empty content)
+            self._notify_watchers(filename, "")
+
+    async def _handle_file_modification(self, filename: str, file_path: Path) -> None:
+        """
+        Handle modification of a tracked file.
+
+        Args:
+            filename: Relative path of the modified file
+            file_path: Absolute path to the modified file
+        """
+        if not file_path.exists():
+            # File was moved or deleted between detection and processing
+            await self._handle_file_deletion(filename)
+            return
+
+        try:
+            # Get current file stats
+            file_stat = file_path.stat()
+            current_mtime = file_stat.st_mtime
+
+            # Check if mtime actually changed
+            if filename in self.files and self.files[filename].mtime == current_mtime:
+                return  # No actual change
+
+            # Read the new content
+            new_content = file_path.read_text(encoding="utf-8")
+
+            # Update our internal state
+            if filename in self.files:
+                self.files[filename].content = new_content
+                self.files[filename].mtime = current_mtime
+
+                # Notify watchers of the change
+                self._notify_watchers(filename, new_content)
+
+        except (OSError, UnicodeDecodeError) as e:
+            # Error reading file, might be temporarily inaccessible
+            print(f"Error reading modified file {filename}: {e}")

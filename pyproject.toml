@@ -9,6 +9,8 @@ dependencies = [
     "pydantic",
     "google-genai>=1.29.0",
     "beeai-framework>=0.1.36",
+    "watchfiles>=1.1.0",
+    "pytest-asyncio>=1.1.0",
 ]
 
 [tool.setuptools.packages.find]

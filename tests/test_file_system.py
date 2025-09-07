@@ -2,6 +2,7 @@ import pytest
 import tempfile
 from pathlib import Path
 import subprocess
+import asyncio
 from unittest.mock import patch
 
 from src.organized.file_system import FileSystem, FileSystemWatcher
@@ -38,11 +39,66 @@ def git_repo():
 class MockWatcher(FileSystemWatcher):
     """Mock watcher for testing."""
 
+    WAIT_TIMEOUT = 1.0  # 1 second timeout for wait operations
+
     def __init__(self):
         self.changes = []
+        self._condition = asyncio.Condition()
 
     def on_file_change(self, filename: str, content: str) -> None:
+        # Always add the change to the list synchronously
         self.changes.append((filename, content))
+
+        # Try to notify async waiters if there's an event loop
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            # No event loop running, which is fine for sync tests
+            return
+
+        async def notify():
+            async with self._condition:
+                self._condition.notify_all()
+
+        # Schedule the async notification
+        asyncio.create_task(notify())
+
+    async def wait_for(self, predicate, timeout: float = WAIT_TIMEOUT) -> bool:
+        """
+        Wait for a change that matches the given predicate.
+
+        Args:
+            predicate: Function that takes a (filename, content) tuple and returns bool
+            timeout: Maximum time to wait in seconds
+
+        Returns:
+            True if matching change was found, False if timeout
+        """
+        async with self._condition:
+            try:
+                await asyncio.wait_for(
+                    self._condition.wait_for(
+                        lambda: any(predicate(change) for change in self.changes)
+                    ),
+                    timeout=timeout,
+                )
+                return True
+            except asyncio.TimeoutError:
+                return False
+
+    async def wait_for_change_count(
+        self, count: int, timeout: float = WAIT_TIMEOUT
+    ) -> bool:
+        """Wait until we have at least 'count' changes."""
+        async with self._condition:
+            try:
+                await asyncio.wait_for(
+                    self._condition.wait_for(lambda: len(self.changes) >= count),
+                    timeout=timeout,
+                )
+                return True
+            except asyncio.TimeoutError:
+                return False
 
 
 class TestFileSystem:
@@ -315,3 +371,196 @@ class TestFileSystem:
         # Close properly
         fs.close_file("test.txt")
         assert "test.txt" not in fs.files
+
+
+class TestFileSystemWatching:
+    """Test cases for file system watching functionality."""
+
+    @pytest.mark.asyncio
+    async def test_watch_files_context_manager(self, git_repo):
+        """Test that watch_files context manager works correctly."""
+        fs = FileSystem(git_repo)
+        watcher = MockWatcher()
+        fs.add_watcher(watcher)
+
+        # Open a file to track it
+        fs.open_file("test.txt")
+
+        async with fs.watch_files():
+            # Modify the file externally
+            (git_repo / "test.txt").write_text("externally modified content")
+
+            # Wait for the change to be detected
+            found = await watcher.wait_for(
+                lambda c: c[0] == "test.txt" and "externally modified content" in c[1]
+            )
+            assert found, "File change was not detected within timeout"
+
+    @pytest.mark.asyncio
+    async def test_watch_files_ignores_untracked_files(self, git_repo):
+        """Test that file watcher ignores changes to untracked files."""
+        fs = FileSystem(git_repo)
+        watcher = MockWatcher()
+        fs.add_watcher(watcher)
+
+        async with fs.watch_files():
+            # Create and modify a file that isn't being tracked
+            untracked_file = git_repo / "untracked.txt"
+            untracked_file.write_text("untracked content")
+
+            # Wait a short time to see if any changes are detected
+            found = await watcher.wait_for_change_count(1, timeout=0.2)
+
+        # Should not have detected any changes since file wasn't tracked
+        assert not found, "Untracked file changes should be ignored"
+        assert len(watcher.changes) == 0
+
+    @pytest.mark.asyncio
+    async def test_watch_files_handles_file_deletion(self, git_repo):
+        """Test that file watcher handles file deletion correctly."""
+        fs = FileSystem(git_repo)
+        watcher = MockWatcher()
+        fs.add_watcher(watcher)
+
+        # Open a file to track it
+        fs.open_file("test.txt")
+
+        async with fs.watch_files():
+            # Delete the file externally
+            (git_repo / "test.txt").unlink()
+
+            # Wait for deletion to be detected (notified with empty content)
+            found = await watcher.wait_for(lambda c: c[0] == "test.txt" and c[1] == "")
+            assert found, "File deletion was not detected"
+
+        # Check that deletion was handled properly
+        assert "test.txt" not in fs.files
+
+    @pytest.mark.asyncio
+    async def test_watch_files_updates_internal_state(self, git_repo):
+        """Test that file watcher updates internal FileSystem state."""
+        fs = FileSystem(git_repo)
+        watcher = MockWatcher()
+        fs.add_watcher(watcher)
+
+        # Open and track a file
+        original_content = fs.open_file("test.txt")
+        assert fs.files["test.txt"].content == original_content
+
+        async with fs.watch_files():
+            # Modify the file externally
+            new_content = "modified by external process"
+            (git_repo / "test.txt").write_text(new_content)
+
+            # Wait for change detection
+            found = await watcher.wait_for(
+                lambda c: c[0] == "test.txt" and new_content in c[1]
+            )
+            assert found, "File modification was not detected"
+
+        # Internal state should be updated
+        assert fs.files["test.txt"].content == new_content
+
+    @pytest.mark.asyncio
+    async def test_watch_files_ignores_git_directory(self, git_repo):
+        """Test that file watcher ignores changes in .git directory."""
+        fs = FileSystem(git_repo)
+        watcher = MockWatcher()
+        fs.add_watcher(watcher)
+
+        async with fs.watch_files():
+            # Create a file in .git directory
+            git_file = git_repo / ".git" / "test_file"
+            git_file.write_text("git internal content")
+
+            # Wait briefly to see if change is detected
+            found = await watcher.wait_for_change_count(1, timeout=0.2)
+
+        # Should not have detected the change
+        assert not found, "Changes in .git directory should be ignored"
+        assert len(watcher.changes) == 0
+
+    @pytest.mark.asyncio
+    async def test_watch_files_handles_multiple_files(self, git_repo):
+        """Test watching multiple files simultaneously."""
+        fs = FileSystem(git_repo)
+        watcher = MockWatcher()
+        fs.add_watcher(watcher)
+
+        # Create and open multiple files
+        file2 = git_repo / "file2.txt"
+        file2.write_text("file2 content")
+        file3 = git_repo / "file3.txt"
+        file3.write_text("file3 content")
+
+        fs.open_file("test.txt")
+        fs.open_file("file2.txt")
+        fs.open_file("file3.txt")
+
+        async with fs.watch_files():
+            # Modify all files
+            (git_repo / "test.txt").write_text("test modified")
+            (git_repo / "file2.txt").write_text("file2 modified")
+            (git_repo / "file3.txt").write_text("file3 modified")
+
+            # Wait for all changes to be detected
+            found = await watcher.wait_for_change_count(3)
+            assert found, "Not all file changes were detected"
+
+        # Should have detected changes to all tracked files
+        modified_files = {change[0] for change in watcher.changes}
+        assert "test.txt" in modified_files
+        assert "file2.txt" in modified_files
+        assert "file3.txt" in modified_files
+
+    @pytest.mark.asyncio
+    async def test_watch_files_handles_subdirectory_files(self, git_repo):
+        """Test watching files in subdirectories."""
+        fs = FileSystem(git_repo)
+        watcher = MockWatcher()
+        fs.add_watcher(watcher)
+
+        # Create subdirectory and file
+        subdir = git_repo / "subdir"
+        subdir.mkdir()
+        subfile = subdir / "subfile.txt"
+        subfile.write_text("subfile content")
+
+        # Track the file
+        fs.open_file("subdir/subfile.txt")
+
+        async with fs.watch_files():
+            # Modify the subdirectory file
+            subfile.write_text("subfile modified")
+
+            # Wait for change detection
+            found = await watcher.wait_for(
+                lambda c: c[0] == "subdir/subfile.txt" and "subfile modified" in c[1]
+            )
+            assert found, "Subdirectory file change was not detected"
+
+    @pytest.mark.asyncio
+    async def test_watch_files_exception_handling(self, git_repo):
+        """Test that exceptions in file processing don't crash the watcher."""
+        fs = FileSystem(git_repo)
+        watcher = MockWatcher()
+        fs.add_watcher(watcher)
+
+        # Track a file
+        fs.open_file("test.txt")
+
+        async with fs.watch_files():
+            # Create a file and track it, then delete it immediately (race condition)
+            temp_file = git_repo / "temp.txt"
+            temp_file.write_text("temp content")
+            fs.open_file("temp.txt")
+            temp_file.unlink()
+
+            # Modify the original tracked file to ensure watcher is still working
+            (git_repo / "test.txt").write_text("still working after exception")
+
+            # Wait for the test.txt change to be detected
+            found = await watcher.wait_for(
+                lambda c: c[0] == "test.txt" and "still working" in c[1]
+            )
+            assert found, "Watcher should still work after handling exceptions"
