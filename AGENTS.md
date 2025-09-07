@@ -67,3 +67,24 @@ To reformat frontend code, navigate to the `ui/` directory and run:
 ```bash
 npm run prettier-write
 ```
+
+### Commit Messages
+- Commit messages should aid **drive-by reviewers with limited context**.
+  Assume the reader does not know the project well.
+- Write commit messages in the tense that reflects the state of the project
+  **just before** the commit is applied. When discussing the old behavior,
+  treat it as the current behavior, and when discussing the changes treat
+  them as new behavior.
+- Format:
+  - **First line**: a concise summary of the change being made with a short
+    prefix (`project:`, `cli:`, `debuginfo:`, etc.).  Make the prefix all
+    lowercase, but capitalize the first word of the summary.  If you don't know
+    what prefix to use, run `git log --pretty=online FILE` and see the prefixes
+    that were used previously.
+  - **Body of commit**: 2-3 short natural language paragraphs that: summarize the code
+    being changed (not the change itself), explain the problem with the existing
+    state of affairs, and describe how the problem is solved by the commit.
+- The summary line should be around 60 characters long
+- All other paragraphs should wrap at 68 characters
+- Reserve the demonstrative determiner "this" for the commit itself. Use "that"
+or other options to refer to anything else.
