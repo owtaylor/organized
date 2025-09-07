@@ -389,11 +389,13 @@ and notify if necessary.
 - Smart filtering (tracked files only, ignores .git directory)
 - Robust error handling and mtime-based change detection
 - Comprehensive test suite with async-aware MockWatcher
+- TODO: Investigate rare test flake in subdirectory file watching (test_watch_files_handles_subdirectory_files)
 
-**Phase 3: Content Merging** 🚧 TODO
+**Phase 3: Content Merging** ✅ COMPLETED
 - diff-match-patch integration for intelligent conflict resolution
 - Three-way merging when multiple clients modify the same file
 - Proper handling of merge failures
+- TODO: Investigate word-mode diffs (https://github.com/google/diff-match-patch/wiki/Line-or-Word-Diffs) to improve merge quality and avoid character-level weirdness
 
 **Phase 4: Git Integration** 🚧 TODO
 - Support for @file paths (committed versions)

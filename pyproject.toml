@@ -11,6 +11,7 @@ dependencies = [
     "beeai-framework>=0.1.36",
     "watchfiles>=1.1.0",
     "pytest-asyncio>=1.1.0",
+    "diff-match-patch>=20241021",
 ]
 
 [tool.setuptools.packages.find]

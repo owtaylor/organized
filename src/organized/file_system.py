@@ -8,6 +8,7 @@ as specified in FILESYSTEM_DESIGN.md.
 
 import abc
 import asyncio
+import logging
 import os
 import tempfile
 from contextlib import asynccontextmanager
@@ -16,6 +17,9 @@ from pathlib import Path
 from typing import Dict, List, Optional, Callable, AsyncIterator
 
 from watchfiles import awatch, Change
+from diff_match_patch import diff_match_patch
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -192,13 +196,15 @@ class FileSystem:
                 # File doesn't exist, create new entry
                 current_content = ""
 
-            # Simple conflict resolution: if last_content matches current, use new content
-            # Otherwise, keep current content (will be improved with diff-match-patch)
+            # Intelligent conflict resolution using diff-match-patch
             if last_content == current_content:
+                # No conflict - use new content directly
                 new_content = content
             else:
-                # For now, just use the new content - this will be improved
-                new_content = content
+                # Conflict detected - perform three-way merge
+                new_content = self._merge_content(
+                    current_content, last_content, content
+                )
 
             # Write to disk atomically and get mtime
             mtime = self._write_file_atomic(file_path, new_content)
@@ -310,6 +316,45 @@ class FileSystem:
 
             raise
 
+    def _merge_content(
+        self, current_content: str, last_content: str, new_content: str
+    ) -> str:
+        """
+        Merge content using diff-match-patch algorithm.
+
+        Args:
+            current_content: The current file content on disk
+            last_content: The content as last known by the client
+            new_content: The new content the client wants to write
+
+        Returns:
+            The merged content, with failed patches discarded
+        """
+        try:
+            # Create diff-match-patch instance
+            dmp = diff_match_patch()
+
+            # Create patches representing the changes from last_content to new_content
+            patches = dmp.patch_make(last_content, new_content)
+
+            # Apply the patches to the current content
+            result = dmp.patch_apply(patches, current_content)
+
+            # result is a tuple: (merged_text, list_of_boolean_results)
+            merged_text, patch_results = result
+
+            # According to the design, we should discard failed patches gracefully
+            # The diff-match-patch library already does this - it returns the best-effort result
+            # We don't need to check patch_results for this implementation
+
+            return merged_text
+
+        except Exception:
+            # If diff-match-patch fails for any reason, fall back to keeping current content
+            # This ensures the system never crashes due to merge failures
+            logger.exception("Content merge failed, keeping current content")
+            return current_content
+
     def _notify_watchers(
         self,
         filename: str,
@@ -388,9 +433,9 @@ class FileSystem:
                 # File was added or modified
                 await self._handle_file_modification(filename, file_path)
 
-        except Exception as e:
+        except Exception:
             # Log error but continue processing other changes
-            print(f"Error handling file change for {file_path}: {e}")
+            logger.exception("Error handling file change for %s", file_path)
 
     async def _handle_file_deletion(self, filename: str) -> None:
         """
@@ -441,6 +486,6 @@ class FileSystem:
                 # Notify watchers of the change
                 self._notify_watchers(filename, new_content)
 
-        except (OSError, UnicodeDecodeError) as e:
+        except (OSError, UnicodeDecodeError):
             # Error reading file, might be temporarily inaccessible
-            print(f"Error reading modified file {filename}: {e}")
+            logger.exception("Error reading modified file %s", filename)
