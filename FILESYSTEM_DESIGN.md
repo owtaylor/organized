@@ -397,11 +397,12 @@ and notify if necessary.
 - Proper handling of merge failures
 - TODO: Investigate word-mode diffs (https://github.com/google/diff-match-patch/wiki/Line-or-Word-Diffs) to improve merge quality and avoid character-level weirdness
 
-**Phase 4: Git Integration** 🚧 TODO
-- Support for @file paths (committed versions)
-- Git commit functionality with proper staging
-- Reading files from specific git revisions
-- Handling of git HEAD changes and ref updates
+**Phase 4: Git Integration** ✅ COMPLETED
+- Support for @file paths (committed versions) - implemented in FileSystem.open_file()
+- Git commit functionality with proper staging - implemented in FileSystem.commit()
+- Manual HEAD resolution and tracking - implemented with _resolve_head_commit()
+- Real-time HEAD change detection and @file updates when commits/branches change
+- Integration with file watching system to detect .git directory changes
 
 **Phase 5: WebSocket Protocol** 🚧 TODO
 - WebSocket server implementation

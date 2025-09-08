@@ -10,6 +10,7 @@ import abc
 import asyncio
 import logging
 import os
+import subprocess
 import tempfile
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -74,67 +75,105 @@ class FileSystem:
         self.files: Dict[str, File] = {}
         self.watchers: List[FileSystemWatcher] = []
 
+        # Git HEAD tracking
+        self._git_head_file = self.repository_path / ".git" / "HEAD"
+        self._current_head_commit: Optional[str] = None
+        self._current_ref_file: Optional[Path] = None  # File to watch for ref changes
+
     def _normalize_and_validate_path(self, filename: str) -> Path:
         """
-        Normalize and validate a file path to prevent directory traversal.
+        Validate a file path to prevent directory traversal and ensure it's normalized.
 
         Args:
-            filename: The input filename/path
+            filename: The input filename/path (must be already normalized)
 
         Returns:
             Absolute Path object within the repository
 
         Raises:
-            ValueError: If the path attempts to escape the repository
+            ValueError: If the path attempts to escape the repository or is not normalized
         """
-        # Convert to Path object and resolve any . and .. components
+        # Convert to Path object
         path = Path(filename)
 
-        # Convert to absolute path within repository context
-        absolute_path = (self.repository_path / path).resolve()
-
-        # Check if the resolved path is within the repository
-        try:
-            # This will raise ValueError if absolute_path is not within repository_path
-            absolute_path.relative_to(self.repository_path)
-            return absolute_path
-
-        except ValueError:
+        # Check if the path is already normalized (no . or .. components, no double slashes)
+        normalized_path = Path(os.path.normpath(filename))
+        if str(path) != str(normalized_path):
             raise ValueError(
-                f"Path '{filename}' attempts to access files outside the repository"
+                f"Path '{filename}' is not normalized. Use '{normalized_path}' instead."
             )
+
+        # Additional checks for problematic patterns
+        if ".." in path.parts or "." in path.parts:
+            raise ValueError(f"Path '{filename}' contains '.' or '..' components")
+
+        # Check for absolute paths (should be relative to repository)
+        if path.is_absolute():
+            raise ValueError(f"Path '{filename}' must be relative to repository root")
+
+        # Convert to absolute path within repository context
+        absolute_path = self.repository_path / path
+
+        # NOTE: We don't use .resolve() here to avoid symlink-based escapes because:
+        # 1. resolve() checks are racy (symlinks can be created between check and use)
+        # 2. Our main defense is not providing any facility to create symlinks
+        # 3. For proper symlink defense, we would need to resolve paths ourselves
+        #    using O_NOFOLLOW and O_DIRECTORY flags during file operations
+
+        return absolute_path
 
     def open_file(self, filename: str) -> str:
         """
         Open a file and increment its reference count.
 
         Args:
-            filename: Path to the file relative to repository root
+            filename: Path to the file relative to repository root.
+                     Use @filename to open the committed version from git.
 
         Returns:
             Current content of the file
 
         Raises:
             FileNotFoundError: If the file doesn't exist
-            ValueError: If the path attempts to escape the repository
+            ValueError: If the path attempts to escape the repository or is not normalized
         """
-        file_path = self._normalize_and_validate_path(filename)
+        if self._is_committed_file_path(filename):
+            # Handle @file paths (committed versions)
+            git_file_path = self._extract_git_file_path(filename)
 
-        if filename not in self.files:
-            # First time opening this file
-            if not file_path.exists():
-                raise FileNotFoundError(f"File not found: {filename}")
+            # Validate the extracted path (without @)
+            self._normalize_and_validate_path(git_file_path)
 
-            # Stat first, then read to avoid race condition
-            file_stat = file_path.stat()
-            content = file_path.read_text(encoding="utf-8")
+            if filename not in self.files:
+                # First time opening this committed file
+                content = self._read_file_from_git(git_file_path)
 
-            self.files[filename] = File(
-                content=content, ref_count=1, mtime=file_stat.st_mtime
-            )
+                # For committed files, we don't track mtime from disk
+                # Instead, we could track the commit hash, but for now use 0
+                self.files[filename] = File(content=content, ref_count=1, mtime=0.0)
+            else:
+                # File already open, increment reference count
+                self.files[filename].ref_count += 1
+
         else:
-            # File already open, increment reference count
-            self.files[filename].ref_count += 1
+            # Handle regular file paths (working directory)
+            file_path = self._normalize_and_validate_path(filename)
+
+            if filename not in self.files:
+                # First time opening this file
+                if not file_path.exists():
+                    raise FileNotFoundError(f"File not found: {filename}")
+
+                # Stat first, then read to avoid race condition
+                file_stat = file_path.stat()
+                content = file_path.read_text(encoding="utf-8")
+
+                self.files[filename] = File(
+                    content=content, ref_count=1, mtime=file_stat.st_mtime
+                )
+            else:
+                # File already open, increment reference count
+                self.files[filename].ref_count += 1
 
         return self.files[filename].content
 
@@ -369,17 +408,21 @@ class FileSystem:
     @asynccontextmanager
     async def watch_files(self) -> AsyncIterator[None]:
         """
-        Async context manager for watching file changes.
+        Async context manager for watching file changes and git HEAD changes.
 
         Usage:
             async with filesystem.watch_files():
                 # File changes will be automatically detected and processed
                 await some_other_work()
         """
+        # Initialize HEAD tracking
+        self._initialize_head_tracking()
 
         async def _watch_files() -> None:
             try:
-                async for changes in awatch(self.repository_path):
+                async for changes in awatch(
+                    self.repository_path, recursive=True, watch_filter=None
+                ):
                     for change_type, file_path_str in changes:
                         await self._handle_file_change(change_type, Path(file_path_str))
             except asyncio.CancelledError:
@@ -418,8 +461,19 @@ class FileSystem:
                 # File is outside repository, ignore
                 return
 
-            # Skip .git directory changes
+            # Handle .git directory changes for HEAD tracking
             if filename.startswith(".git/") or filename == ".git":
+                # Check if this is a change to HEAD or the current ref file
+                if file_path == self._git_head_file or (
+                    self._current_ref_file and file_path == self._current_ref_file
+                ):
+                    # Check for HEAD changes
+                    logger.debug(
+                        "Detected change to git file %s, checking HEAD changes",
+                        file_path,
+                    )
+                    changed = self._check_head_changes()
+                    logger.debug("HEAD change check result: %s", changed)
                 return
 
             # Only process files that are currently being tracked
@@ -489,3 +543,184 @@ class FileSystem:
         except (OSError, UnicodeDecodeError):
             # Error reading file, might be temporarily inaccessible
             logger.exception("Error reading modified file %s", filename)
+
+    def _is_committed_file_path(self, filename: str) -> bool:
+        """Check if filename uses @file syntax for committed versions."""
+        return filename.startswith("@")
+
+    def _extract_git_file_path(self, filename: str) -> str:
+        """Extract the actual file path from @file syntax."""
+        if not self._is_committed_file_path(filename):
+            raise ValueError(f"Not a committed file path: {filename}")
+        return filename[1:]  # Remove the @ prefix
+
+    def _read_file_from_git(self, git_file_path: str, revision: str = "HEAD") -> str:
+        """
+        Read a file from a specific git revision.
+
+        Args:
+            git_file_path: Path to the file within the git repository
+            revision: Git revision (default: HEAD)
+
+        Returns:
+            Content of the file in the specified revision
+
+        Raises:
+            FileNotFoundError: If file doesn't exist in the revision
+            ValueError: If revision is invalid
+        """
+        try:
+            result = subprocess.run(
+                ["git", "cat-file", "blob", f"{revision}:{git_file_path}"],
+                cwd=self.repository_path,
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            return result.stdout
+        except subprocess.CalledProcessError as e:
+            if "does not exist" in e.stderr or "not in the working tree" in e.stderr:
+                raise FileNotFoundError(f"File not found in git: @{git_file_path}")
+            elif "bad revision" in e.stderr or "unknown revision" in e.stderr:
+                raise ValueError(f"Invalid git revision: {revision}")
+            else:
+                # Re-raise with original error for unexpected cases
+                raise
+
+    def commit(self, message: str) -> None:
+        """
+        Commit all changes to the git repository.
+
+        Args:
+            message: Commit message
+
+        Raises:
+            RuntimeError: If git commands fail
+        """
+        try:
+            # Stage all changes (respects .gitignore)
+            subprocess.run(
+                ["git", "add", "-A"],
+                cwd=self.repository_path,
+                check=True,
+                capture_output=True,
+            )
+
+            # Create the commit
+            subprocess.run(
+                ["git", "commit", "-m", message],
+                cwd=self.repository_path,
+                check=True,
+                capture_output=True,
+            )
+
+            # Notify watchers about the successful commit
+            # This will be enhanced when we add HEAD change detection
+
+        except subprocess.CalledProcessError as e:
+            # Handle the case where there's nothing to commit
+            if (
+                "nothing to commit" in e.stdout.decode()
+                or "nothing to commit" in e.stderr.decode()
+            ):
+                # This is not an error - just means no changes were made
+                pass
+            else:
+                raise RuntimeError(f"Git commit failed: {e.stderr.decode()}")
+
+    def _resolve_head_commit(self) -> tuple[str, Optional[Path]]:
+        """
+        Manually resolve HEAD to the actual commit hash.
+
+        Returns:
+            Tuple of (commit_hash, ref_file_to_watch) where ref_file_to_watch
+            is the file that should be monitored for changes to this commit
+        """
+        try:
+            # Read HEAD file
+            head_content = self._git_head_file.read_text().strip()
+
+            if head_content.startswith("ref: "):
+                # HEAD points to a ref (branch) - read the ref file
+                ref_path = head_content[5:]  # Remove "ref: " prefix
+                ref_file = self.repository_path / ".git" / ref_path
+
+                try:
+                    commit_hash = ref_file.read_text().strip()
+                    return commit_hash, ref_file
+                except FileNotFoundError:
+                    # Ref doesn't exist yet (new repository)
+                    return "", ref_file
+            else:
+                # HEAD points directly to a commit (detached) - use HEAD content
+                return head_content, self._git_head_file
+
+        except (OSError, FileNotFoundError):
+            # Git repository might be in an unusual state
+            return "", self._git_head_file
+
+    def _initialize_head_tracking(self) -> None:
+        """Initialize HEAD tracking by resolving current commit."""
+        try:
+            self._current_head_commit, self._current_ref_file = (
+                self._resolve_head_commit()
+            )
+        except Exception:
+            logger.exception("Failed to initialize HEAD tracking")
+            self._current_head_commit = None
+            self._current_ref_file = None
+
+    def _check_head_changes(self) -> bool:
+        """
+        Check if HEAD has changed by re-resolving and comparing.
+
+        Returns:
+            True if changes were detected and processed
+        """
+        try:
+            new_head_commit, new_ref_file = self._resolve_head_commit()
+
+            if new_head_commit != self._current_head_commit:
+                # HEAD changed - update tracking and committed files
+                self._current_head_commit = new_head_commit
+                self._current_ref_file = new_ref_file
+
+                # Update all open committed files
+                self._update_committed_files()
+
+                return True
+
+        except Exception:
+            logger.exception("Error checking HEAD changes")
+
+        return False
+
+    def _update_committed_files(self) -> None:
+        """Update all open committed files to reflect the current HEAD."""
+        committed_files = [
+            filename
+            for filename in self.files.keys()
+            if self._is_committed_file_path(filename)
+        ]
+
+        for filename in committed_files:
+            try:
+                git_file_path = self._extract_git_file_path(filename)
+                old_content = self.files[filename].content
+
+                try:
+                    new_content = self._read_file_from_git(git_file_path)
+                except FileNotFoundError:
+                    # File was deleted in the new commit
+                    new_content = ""
+
+                # Only notify watchers if content actually changed
+                if new_content != old_content:
+                    # Update internal state
+                    self.files[filename].content = new_content
+
+                    # Notify watchers
+                    self._notify_watchers(filename, new_content)
+
+            except Exception:
+                logger.exception("Error updating committed file %s", filename)

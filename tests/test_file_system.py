@@ -310,36 +310,33 @@ class TestFileSystem:
 
         for path in dangerous_paths:
             with pytest.raises(
-                ValueError, match="attempts to access files outside the repository"
+                ValueError,
+                match="contains '.' or '..' components|is not normalized|must be relative to repository root",
             ):
                 fs.open_file(path)
 
             with pytest.raises(
-                ValueError, match="attempts to access files outside the repository"
+                ValueError,
+                match="contains '.' or '..' components|is not normalized|must be relative to repository root",
             ):
                 fs.write_file(path, "", "malicious content")
 
             with pytest.raises(
-                ValueError, match="attempts to access files outside the repository"
+                ValueError,
+                match="contains '.' or '..' components|is not normalized|must be relative to repository root",
             ):
                 fs.edit_file(path, lambda x: "malicious")
 
-    def test_path_normalization_within_repo(self, git_repo):
-        """Test that valid relative paths are normalized correctly."""
+    def test_path_validation_requires_normalized_paths(self, git_repo):
+        """Test that path validation requires already-normalized paths."""
         fs = FileSystem(git_repo)
 
-        # Create a subdirectory and file
-        (git_repo / "subdir").mkdir()
-        (git_repo / "subdir" / "file.txt").write_text("test content")
+        # Test that unnormalized paths are rejected
+        with pytest.raises(ValueError, match="is not normalized"):
+            fs.open_file("subdir/../file.txt")
 
-        # Test that normalization works for reading existing files
-        content = fs.open_file("subdir/file.txt")
-        assert content == "test content"
-        fs.close_file("subdir/file.txt")
-
-        # Test that normalized path works for writing
-        fs.write_file("subdir/../new_file.txt", "", "new content")
-        assert (git_repo / "new_file.txt").read_text() == "new content"
+        with pytest.raises(ValueError, match="is not normalized"):
+            fs.write_file("subdir/../new_file.txt", "", "new content")
 
     def test_write_file_new_file_no_ref_leak(self, git_repo):
         """Test that write_file doesn't leave refcount=0 entries for new files."""
@@ -571,7 +568,8 @@ class TestFileSystemWatching:
 
             # Wait for the change to be detected
             found = await watcher.wait_for(
-                lambda c: c[0] == "test.txt" and "externally modified content" in c[1]
+                lambda c: c[0] == "test.txt" and "externally modified content" in c[1],
+                timeout=5.0,
             )
             assert found, "File change was not detected within timeout"
 
@@ -743,3 +741,349 @@ class TestFileSystemWatching:
                 lambda c: c[0] == "test.txt" and "still working" in c[1]
             )
             assert found, "Watcher should still work after handling exceptions"
+
+
+class TestGitIntegration:
+    """Test cases for Git integration functionality."""
+
+    def test_open_committed_file_basic(self, git_repo):
+        """Test opening a committed file using @file syntax."""
+        fs = FileSystem(git_repo)
+
+        # Open committed version of test.txt (should have "initial content")
+        content = fs.open_file("@test.txt")
+        assert content == "initial content"
+        assert "@test.txt" in fs.files
+        assert fs.files["@test.txt"].ref_count == 1
+
+    def test_open_committed_file_vs_working_copy(self, git_repo):
+        """Test that @file returns committed version, not working directory version."""
+        fs = FileSystem(git_repo)
+
+        # Modify working copy
+        (git_repo / "test.txt").write_text("modified in working directory")
+
+        # Working copy should show modified content
+        working_content = fs.open_file("test.txt")
+        assert working_content == "modified in working directory"
+
+        # Committed version should still show original content
+        committed_content = fs.open_file("@test.txt")
+        assert committed_content == "initial content"
+
+        # Both should be tracked separately
+        assert "test.txt" in fs.files
+        assert "@test.txt" in fs.files
+
+    def test_open_nonexistent_committed_file(self, git_repo):
+        """Test opening a committed file that doesn't exist in the repository."""
+        fs = FileSystem(git_repo)
+
+        with pytest.raises(
+            FileNotFoundError, match="File not found in git: @nonexistent.txt"
+        ):
+            fs.open_file("@nonexistent.txt")
+
+    def test_open_committed_file_reference_counting(self, git_repo):
+        """Test reference counting works for committed files."""
+        fs = FileSystem(git_repo)
+
+        # Open same committed file multiple times
+        content1 = fs.open_file("@test.txt")
+        content2 = fs.open_file("@test.txt")
+
+        assert content1 == content2 == "initial content"
+        assert fs.files["@test.txt"].ref_count == 2
+
+        # Close and verify ref counting
+        fs.close_file("@test.txt")
+        assert fs.files["@test.txt"].ref_count == 1
+        assert "@test.txt" in fs.files
+
+        fs.close_file("@test.txt")
+        assert "@test.txt" not in fs.files
+
+    def test_committed_file_path_validation(self, git_repo):
+        """Test path validation works for committed files."""
+        fs = FileSystem(git_repo)
+
+        # Test path traversal protection for committed files
+        with pytest.raises(ValueError, match="contains '.' or '..' components"):
+            fs.open_file("@../../../etc/passwd")
+
+    def test_open_committed_file_after_new_commit(self, git_repo):
+        """Test that @file reflects latest commit after new commits are made."""
+        fs = FileSystem(git_repo)
+
+        # Open committed version (original content)
+        content1 = fs.open_file("@test.txt")
+        assert content1 == "initial content"
+        fs.close_file("@test.txt")
+
+        # Make a new commit
+        (git_repo / "test.txt").write_text("updated content")
+        subprocess.run(["git", "add", "test.txt"], cwd=git_repo, check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "Update test.txt"], cwd=git_repo, check=True
+        )
+
+        # Opening committed version again should show new content
+        content2 = fs.open_file("@test.txt")
+        assert content2 == "updated content"
+
+
+class TestGitCommit:
+    """Test cases for git commit functionality."""
+
+    def test_commit_basic(self, git_repo):
+        """Test basic commit functionality."""
+        fs = FileSystem(git_repo)
+
+        # Create and modify some files
+        (git_repo / "new_file.txt").write_text("new file content")
+        (git_repo / "test.txt").write_text("modified content")
+
+        # Commit changes
+        fs.commit("Add new file and modify existing file")
+
+        # Verify commit was created
+        result = subprocess.run(
+            ["git", "log", "--oneline", "-1"],
+            cwd=git_repo,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        assert "Add new file and modify existing file" in result.stdout
+
+    def test_commit_with_staged_files(self, git_repo):
+        """Test commit includes properly staged files."""
+        fs = FileSystem(git_repo)
+
+        # Create new files
+        (git_repo / "file1.txt").write_text("content 1")
+        (git_repo / "file2.txt").write_text("content 2")
+
+        # Commit should stage and commit all changes
+        fs.commit("Add two new files")
+
+        # Verify both files are in the commit
+        result = subprocess.run(
+            ["git", "show", "--name-only", "HEAD"],
+            cwd=git_repo,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        assert "file1.txt" in result.stdout
+        assert "file2.txt" in result.stdout
+
+    def test_commit_empty_repository_state(self, git_repo):
+        """Test commit when there are no changes to stage."""
+        fs = FileSystem(git_repo)
+
+        # Try to commit with no changes
+        # This should either succeed (empty commit) or raise appropriate error
+        fs.commit("Empty commit")
+
+        # Verify no error occurred and HEAD didn't change unexpectedly
+        result = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=git_repo,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        # Should be clean (no unstaged changes)
+        assert result.stdout.strip() == ""
+
+    def test_commit_respects_gitignore(self, git_repo):
+        """Test that commit respects .gitignore patterns."""
+        fs = FileSystem(git_repo)
+
+        # Create .gitignore
+        (git_repo / ".gitignore").write_text("*.tmp\nignored/\n")
+
+        # Create ignored and non-ignored files
+        (git_repo / "tracked_file.txt").write_text("tracked content")
+        (git_repo / "ignored_file.tmp").write_text("ignored content")
+        (git_repo / "ignored").mkdir()
+        (git_repo / "ignored" / "file.txt").write_text("ignored content")
+
+        # Commit changes
+        fs.commit("Add files with gitignore test")
+
+        # Verify only non-ignored files were committed
+        result = subprocess.run(
+            ["git", "show", "--name-only", "HEAD"],
+            cwd=git_repo,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        assert "tracked_file.txt" in result.stdout
+        assert ".gitignore" in result.stdout
+        assert "ignored_file.tmp" not in result.stdout
+        assert "ignored/file.txt" not in result.stdout
+
+
+class TestHEADChangeDetection:
+    """Test cases for HEAD change detection and notifications."""
+
+    @pytest.mark.asyncio
+    async def test_head_change_detection_basic(self, git_repo):
+        """Test basic HEAD change detection."""
+        fs = FileSystem(git_repo)
+        watcher = MockWatcher()
+        fs.add_watcher(watcher)
+
+        # Open a committed file to track
+        fs.open_file("@test.txt")
+
+        async with fs.watch_files():
+            # Make a new commit (this changes HEAD)
+            (git_repo / "test.txt").write_text("new committed content")
+
+            subprocess.run(["git", "add", "test.txt"], cwd=git_repo, check=True)
+            subprocess.run(
+                ["git", "commit", "-m", "Update test.txt"], cwd=git_repo, check=True
+            )
+
+            # Wait for HEAD change to be detected and @file to be updated
+            found = await watcher.wait_for(
+                lambda c: c[0] == "@test.txt" and "new committed content" in c[1]
+            )
+            assert found, "HEAD change and @file update was not detected"
+
+    @pytest.mark.asyncio
+    async def test_head_change_updates_multiple_committed_files(self, git_repo):
+        """Test that HEAD changes update all open committed files."""
+        fs = FileSystem(git_repo)
+        watcher = MockWatcher()
+        fs.add_watcher(watcher)
+
+        # Create another file and commit it
+        (git_repo / "file2.txt").write_text("file2 initial")
+        subprocess.run(["git", "add", "file2.txt"], cwd=git_repo, check=True)
+        subprocess.run(["git", "commit", "-m", "Add file2"], cwd=git_repo, check=True)
+
+        # Open both committed files
+        fs.open_file("@test.txt")
+        fs.open_file("@file2.txt")
+
+        async with fs.watch_files():
+            # Modify both files and commit
+            (git_repo / "test.txt").write_text("test updated")
+            (git_repo / "file2.txt").write_text("file2 updated")
+            subprocess.run(["git", "add", "-A"], cwd=git_repo, check=True)
+            subprocess.run(
+                ["git", "commit", "-m", "Update both files"], cwd=git_repo, check=True
+            )
+
+            # Wait for both files to be updated
+            found_test = await watcher.wait_for(
+                lambda c: c[0] == "@test.txt" and "test updated" in c[1]
+            )
+            found_file2 = await watcher.wait_for(
+                lambda c: c[0] == "@file2.txt" and "file2 updated" in c[1]
+            )
+
+            assert found_test, "@test.txt was not updated after HEAD change"
+            assert found_file2, "@file2.txt was not updated after HEAD change"
+
+    @pytest.mark.asyncio
+    async def test_head_change_ignores_non_committed_files(self, git_repo):
+        """Test that HEAD changes don't affect non-committed files."""
+        fs = FileSystem(git_repo)
+        watcher = MockWatcher()
+        fs.add_watcher(watcher)
+
+        # Open both working directory and committed versions
+        fs.open_file("test.txt")
+        fs.open_file("@test.txt")
+
+        # Make the file content change outside watch context
+        (git_repo / "test.txt").write_text("updated content")
+        subprocess.run(["git", "add", "test.txt"], cwd=git_repo, check=True)
+
+        async with fs.watch_files():
+            # Commit the already-staged changes (this only changes git internals, not working files)
+            subprocess.run(
+                ["git", "commit", "-m", "Update test.txt"], cwd=git_repo, check=True
+            )
+
+            # Wait for @test.txt to be updated
+            found_committed = await watcher.wait_for(
+                lambda c: c[0] == "@test.txt" and "updated content" in c[1]
+            )
+            assert found_committed, "@test.txt should be updated"
+
+            # Wait with short timeout to ensure working directory file is NOT notified of HEAD changes
+            found_working = await watcher.wait_for(
+                lambda c: c[0] == "test.txt" and "updated content" in c[1], timeout=0.3
+            )
+            assert not found_working, (
+                "Working directory file should not be notified of HEAD changes"
+            )
+
+    @pytest.mark.asyncio
+    async def test_head_change_handles_file_deletion_in_commit(self, git_repo):
+        """Test HEAD change handling when files are deleted in commits."""
+        fs = FileSystem(git_repo)
+        watcher = MockWatcher()
+        fs.add_watcher(watcher)
+
+        # Create and commit a new file
+        (git_repo / "temp_file.txt").write_text("temporary content")
+        subprocess.run(["git", "add", "temp_file.txt"], cwd=git_repo, check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "Add temp file"], cwd=git_repo, check=True
+        )
+
+        # Open the committed version
+        fs.open_file("@temp_file.txt")
+
+        async with fs.watch_files():
+            # Delete the file and commit the deletion
+            (git_repo / "temp_file.txt").unlink()
+            subprocess.run(["git", "add", "-A"], cwd=git_repo, check=True)
+            subprocess.run(
+                ["git", "commit", "-m", "Delete temp file"], cwd=git_repo, check=True
+            )
+
+            # The committed file should be notified with empty content or removed
+            found = await watcher.wait_for(
+                lambda c: c[0] == "@temp_file.txt" and c[1] == ""
+            )
+            assert found, "Deleted committed file should be notified with empty content"
+
+    @pytest.mark.asyncio
+    async def test_branch_change_detection(self, git_repo):
+        """Test detection of branch changes (when .git/HEAD points to different ref)."""
+        fs = FileSystem(git_repo)
+        watcher = MockWatcher()
+        fs.add_watcher(watcher)
+
+        # Create a new branch with different content
+        subprocess.run(["git", "checkout", "-b", "feature"], cwd=git_repo, check=True)
+        (git_repo / "test.txt").write_text("feature branch content")
+        subprocess.run(["git", "add", "test.txt"], cwd=git_repo, check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "Feature branch commit"], cwd=git_repo, check=True
+        )
+
+        # Go back to main branch
+        subprocess.run(["git", "checkout", "main"], cwd=git_repo, check=True)
+
+        # Open committed file on main branch
+        fs.open_file("@test.txt")
+
+        async with fs.watch_files():
+            # Switch to feature branch (this changes .git/HEAD to point to different ref)
+            subprocess.run(["git", "checkout", "feature"], cwd=git_repo, check=True)
+
+            # Wait for @file to be updated with feature branch content
+            found = await watcher.wait_for(
+                lambda c: c[0] == "@test.txt" and "feature branch content" in c[1]
+            )
+            assert found, "Branch change should update committed file content"
