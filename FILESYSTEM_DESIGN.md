@@ -404,13 +404,38 @@ and notify if necessary.
 - Real-time HEAD change detection and @file updates when commits/branches change
 - Integration with file watching system to detect .git directory changes
 
-**Phase 5: WebSocket Protocol** 🚧 TODO
-- WebSocket server implementation
-- JSON protocol for file operations and events
-- Connection management and reconnection handling
-- Per-connection file reference tracking
+**Phase 5: WebSocket Protocol** ✅ COMPLETED
+- WebSocket server implementation using FastAPI router pattern - implemented in files.py
+- JSON protocol for file operations and events - full protocol support with comprehensive test suite
+- Connection management using Connection class as context manager and FileSystemWatcher
+- Per-connection file reference tracking with automatic cleanup on disconnect
+- Real-time file_updated events from external file system changes
+- Integration with main FastAPI app using lifespan function for file watching
+- Comprehensive test suite (14 test cases) covering all protocol features
 
-**Phase 6: Client Disconnection/Reconnection** 🚧 TODO
-- Proper cleanup of stale connections
-- File state synchronization on reconnect
-- Handling of offline file modifications
+**Phase 6a: Basic TypeScript Client** 🚧 TODO
+- Implement basic FileSystem class with open_file/close_file operations
+- WebSocket connection management (connect/disconnect)
+- Basic protocol message handling for file operations
+- TypeScript type definitions for protocol messages
+- Unit testing framework setup for TypeScript code
+- Mock WebSocket testing for isolated client logic testing
+- Basic error handling and connection state tracking
+
+**Phase 6b: Complete TypeScript Client** 🚧 TODO
+- Implement remaining FileSystem operations (write_file, commit)
+- Client-side file synchronization algorithm (standard mode and during-save mode)
+- Automatic reconnection handling with exponential backoff
+- File state synchronization on reconnect using cached content
+- Support for multiple concurrent file operations and reference counting
+- Comprehensive error handling and connection state management
+- Expand unit test coverage for all client functionality
+
+**Phase 6c: React Integration** 🚧 TODO
+- Integrate TypeScript FileSystem with React application
+- Create React hooks for file operations (useFile, useFileSystem)
+- Replace existing /api/files/TASKS.md REST API usage with WebSocket protocol
+- Implement real-time collaborative editing support
+- Handle UI state updates from file_updated events
+- Error boundary and loading state management
+- Integration testing with the full stack

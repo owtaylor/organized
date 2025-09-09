@@ -1,22 +1,34 @@
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI, Request
 from fastapi.responses import PlainTextResponse
 
 from . import notes
 from .chat import router as chat_router
-from .tasks import ensure_git_repo, read_tasks_file, write_tasks_file
+from .files import router as files_router, get_file_system
+from .tasks import read_tasks_file, write_tasks_file
 
-app = FastAPI()
 
-# Include chat router
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """FastAPI lifespan context manager to handle startup and shutdown."""
+    # Get the file system instance (respecting dependency overrides)
+    if get_file_system in app.dependency_overrides:
+        file_system = app.dependency_overrides[get_file_system]()
+    else:
+        file_system = get_file_system()
+    
+    # Start file watching
+    async with file_system.watch_files():
+        yield
+    # Shutdown: cleanup is handled automatically by the context manager
+
+
+app = FastAPI(lifespan=lifespan)
+
+# Include routers
 app.include_router(chat_router)
-
-
-@app.on_event("startup")
-async def startup_event():
-    """
-    On startup, create the git checkout directory if it doesn't exist and initialize a git repository.
-    """
-    ensure_git_repo()
+app.include_router(files_router)
 
 
 @app.get("/api/files/TASKS.md", response_class=PlainTextResponse)

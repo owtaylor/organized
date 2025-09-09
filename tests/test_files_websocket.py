@@ -1,0 +1,337 @@
+import pytest
+import json
+import tempfile
+from pathlib import Path
+import subprocess
+import asyncio
+from unittest.mock import patch, AsyncMock
+
+from fastapi.testclient import TestClient
+
+from src.organized.main import app
+from src.organized.file_system import FileSystem
+from src.organized.files import get_file_system
+
+
+@pytest.fixture
+def git_repo():
+    """Create a temporary git repository for testing."""
+    with tempfile.TemporaryDirectory() as temp_dir:
+        repo_path = Path(temp_dir)
+
+        # Initialize git repo
+        subprocess.run(["git", "init"], cwd=repo_path, check=True)
+        subprocess.run(
+            ["git", "config", "user.email", "test@example.com"],
+            cwd=repo_path,
+            check=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.name", "Test User"], cwd=repo_path, check=True
+        )
+
+        # Create initial commit
+        test_file = repo_path / "test.txt"
+        test_file.write_text("initial content")
+        subprocess.run(["git", "add", "test.txt"], cwd=repo_path, check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "Initial commit"], cwd=repo_path, check=True
+        )
+
+        yield repo_path
+
+
+@pytest.fixture
+def file_system(git_repo):
+    """Create a FileSystem instance for testing."""
+    return FileSystem(git_repo)
+
+
+@pytest.fixture
+def client(file_system):
+    """Create a TestClient with dependency override."""
+    app.dependency_overrides[get_file_system] = lambda: file_system
+    with TestClient(app) as client:
+        yield client
+
+
+class TestBasicWebSocketConnection:
+    """Test basic WebSocket connection functionality."""
+
+    def test_websocket_connection_establishes(self, client):
+        """Test that WebSocket connection can be established."""
+        with client.websocket_connect("/ws") as websocket:
+            # Send a test command to verify connection works
+            websocket.send_json({"type": "invalid_test"})
+            response = websocket.receive_json()
+            assert response["type"] == "error"
+            assert "Unknown command type" in response["message"]
+
+
+class TestOpenFileCommand:
+    """Test the open_file command and file_opened event."""
+
+    def test_open_existing_file(self, client, git_repo):
+        """Test opening an existing file returns file_opened event."""
+        # Create a test file
+        test_file = git_repo / "TASKS.md"
+        test_file.write_text("# Test Tasks\n\nHello world")
+        
+        with client.websocket_connect("/ws") as websocket:
+            websocket.send_json({
+                "type": "open_file",
+                "path": "TASKS.md"
+            })
+            
+            response = websocket.receive_json()
+            assert response["type"] == "file_opened"
+            assert response["path"] == "TASKS.md"
+            assert response["content"] == "# Test Tasks\n\nHello world"
+
+    def test_open_nonexistent_file_returns_error(self, client):
+        """Test that opening a non-existent file returns an error event."""
+        with client.websocket_connect("/ws") as websocket:
+            websocket.send_json({
+                "type": "open_file",
+                "path": "nonexistent.md"
+            })
+            
+            response = websocket.receive_json()
+            assert response["type"] == "error"
+            assert response["path"] == "nonexistent.md"
+
+    def test_open_file_missing_path_returns_error(self, client):
+        """Test that open_file without path returns error."""
+        with client.websocket_connect("/ws") as websocket:
+            websocket.send_json({
+                "type": "open_file"
+                # Missing "path" field
+            })
+            
+            response = websocket.receive_json()
+            assert response["type"] == "error"
+            assert "Missing required field: path" in response["message"]
+
+    def test_open_at_file_committed_version(self, client, git_repo):
+        """Test opening @file paths for committed versions."""
+        # Create and commit a file
+        test_file = git_repo / "committed.md"
+        test_file.write_text("committed content")
+        subprocess.run(["git", "add", "committed.md"], cwd=git_repo, check=True)
+        subprocess.run(["git", "commit", "-m", "Add committed file"], cwd=git_repo, check=True)
+        
+        # Modify the file after commit
+        test_file.write_text("modified content")
+        
+        with client.websocket_connect("/ws") as websocket:
+            websocket.send_json({
+                "type": "open_file",
+                "path": "@committed.md"
+            })
+            
+            response = websocket.receive_json()
+            assert response["type"] == "file_opened"
+            assert response["path"] == "@committed.md"
+            assert response["content"] == "committed content"
+
+
+class TestCloseFileCommand:
+    """Test the close_file command and file_closed event."""
+
+    def test_close_opened_file(self, client, git_repo):
+        """Test closing an opened file returns file_closed event."""
+        test_file = git_repo / "test.md"
+        test_file.write_text("test content")
+        
+        with client.websocket_connect("/ws") as websocket:
+            # First open the file
+            websocket.send_json({
+                "type": "open_file",
+                "path": "test.md"
+            })
+            websocket.receive_json()  # Skip file_opened event
+            
+            # Now close the file
+            websocket.send_json({
+                "type": "close_file",
+                "path": "test.md"
+            })
+            
+            response = websocket.receive_json()
+            assert response["type"] == "file_closed"
+            assert response["path"] == "test.md"
+
+    def test_close_file_missing_path_returns_error(self, client):
+        """Test that close_file without path returns error."""
+        with client.websocket_connect("/ws") as websocket:
+            websocket.send_json({
+                "type": "close_file"
+                # Missing "path" field
+            })
+            
+            response = websocket.receive_json()
+            assert response["type"] == "error"
+            assert "Missing required field: path" in response["message"]
+
+
+class TestWriteFileCommand:
+    """Test the write_file command and file_written event."""
+
+    def test_write_to_opened_file(self, client, git_repo):
+        """Test writing to an opened file returns file_written event."""
+        test_file = git_repo / "test.md"
+        test_file.write_text("original content")
+        
+        with client.websocket_connect("/ws") as websocket:
+            # First open the file
+            websocket.send_json({
+                "type": "open_file",
+                "path": "test.md"
+            })
+            websocket.receive_json()  # Skip file_opened event
+            
+            # Now write to the file
+            websocket.send_json({
+                "type": "write_file",
+                "path": "test.md",
+                "last_content": "original content",
+                "new_content": "updated content"
+            })
+            
+            response = websocket.receive_json()
+            assert response["type"] == "file_written"
+            assert response["path"] == "test.md"
+            assert response["content"] == "updated content"
+
+    def test_write_file_missing_path_returns_error(self, client):
+        """Test that write_file without path returns error."""
+        with client.websocket_connect("/ws") as websocket:
+            websocket.send_json({
+                "type": "write_file",
+                "last_content": "test",
+                "new_content": "test2"
+                # Missing "path" field
+            })
+            
+            response = websocket.receive_json()
+            assert response["type"] == "error"
+            assert "Missing required field: path" in response["message"]
+
+
+class TestCommitCommand:
+    """Test the commit command and committed event."""
+
+    def test_commit_with_message(self, client, git_repo):
+        """Test commit command sends committed event."""
+        # Create and modify a file
+        test_file = git_repo / "test.md"
+        test_file.write_text("content to commit")
+        
+        with client.websocket_connect("/ws") as websocket:
+            websocket.send_json({
+                "type": "commit",
+                "message": "Test commit\n\nThis is a test commit message"
+            })
+            
+            response = websocket.receive_json()
+            assert response["type"] == "committed"
+
+    def test_commit_missing_message_returns_error(self, client):
+        """Test that commit without message returns error."""
+        with client.websocket_connect("/ws") as websocket:
+            websocket.send_json({
+                "type": "commit"
+                # Missing "message" field
+            })
+            
+            response = websocket.receive_json()
+            assert response["type"] == "error"
+            assert "Missing required field: message" in response["message"]
+
+
+class TestConnectionReferenceTracking:
+    """Test per-connection reference counting."""
+
+    def test_multiple_opens_require_multiple_closes(self, client, git_repo):
+        """Test that opening a file multiple times requires multiple closes."""
+        test_file = git_repo / "refcount.md"
+        test_file.write_text("test content")
+        
+        with client.websocket_connect("/ws") as websocket:
+            # Open the file twice
+            websocket.send_json({
+                "type": "open_file",
+                "path": "refcount.md"
+            })
+            websocket.receive_json()  # file_opened event
+            
+            websocket.send_json({
+                "type": "open_file",
+                "path": "refcount.md"
+            })
+            websocket.receive_json()  # file_opened event
+            
+            # Close the file once
+            websocket.send_json({
+                "type": "close_file",
+                "path": "refcount.md"
+            })
+            response = websocket.receive_json()
+            assert response["type"] == "file_closed"
+            
+            # Close again - should still work
+            websocket.send_json({
+                "type": "close_file",
+                "path": "refcount.md"
+            })
+            response = websocket.receive_json()
+            assert response["type"] == "file_closed"
+
+
+class TestFileUpdatedEvents:
+    """Test file_updated events from external changes."""
+
+    def test_file_updated_event_on_external_change(self, client, git_repo):
+        """Test that external file changes trigger file_updated events."""
+        # Create a test file
+        test_file = git_repo / "watched.md"
+        test_file.write_text("initial content")
+        
+        with client.websocket_connect("/ws") as websocket:
+            # Open the file for watching
+            websocket.send_json({
+                "type": "open_file",
+                "path": "watched.md"
+            })
+            response = websocket.receive_json()
+            assert response["type"] == "file_opened"
+            assert response["content"] == "initial content"
+            
+            # Simulate external change to the file
+            test_file.write_text("externally modified content")
+            
+            # Should receive file_updated event
+            # NOTE: This will hang if file watching is not working properly.
+            # websocket.receive_json() blocks until a message is received.
+            # See https://github.com/Kludex/starlette/discussions/2195 for
+            # a request to add timeout support to receive_json().
+            response = websocket.receive_json()
+            assert response["type"] == "file_updated"
+            assert response["path"] == "watched.md"
+            assert response["content"] == "externally modified content"
+
+
+class TestErrorHandling:
+    """Test error handling scenarios."""
+
+    def test_invalid_command_type_returns_error(self, client):
+        """Test that invalid command types return errors."""
+        with client.websocket_connect("/ws") as websocket:
+            websocket.send_json({
+                "type": "invalid_command",
+                "data": "test"
+            })
+            
+            response = websocket.receive_json()
+            assert response["type"] == "error"
+            assert "Unknown command type: invalid_command" in response["message"]
