@@ -1,7 +1,7 @@
 // TypeScript type definitions for the filesystem WebSocket protocol
 
 // Server events sent to clients
-export type ServerEvent = 
+export type ServerEvent =
   | FileOpenedEvent
   | FileClosedEvent
   | FileUpdatedEvent
@@ -43,7 +43,7 @@ export interface ErrorEvent {
 }
 
 // Client commands sent to server
-export type ClientCommand = 
+export type ClientCommand =
   | OpenFileCommand
   | CloseFileCommand
   | WriteFileCommand
@@ -72,10 +72,7 @@ export interface CommitCommand {
 }
 
 // File events that are exposed to the client API
-export type FileEvent = 
-  | FileOpenedEvent
-  | FileUpdatedEvent
-  | FileWrittenEvent;
+export type FileEvent = FileOpenedEvent | FileUpdatedEvent | FileWrittenEvent;
 
 // FileSystem connection states
 export enum FileSystemState {
@@ -89,9 +86,19 @@ export class FileSystemError extends Error {
   constructor(
     message: string,
     public path?: string,
-    public originalError?: Error
+    public originalError?: Error,
   ) {
     super(message);
     this.name = "FileSystemError";
+  }
+}
+
+export class ConnectionClosedError extends FileSystemError {
+  constructor(
+    message: string,
+    public originalError?: Error,
+  ) {
+    super(message, undefined, originalError);
+    this.name = "ConnectionClosedError";
   }
 }
