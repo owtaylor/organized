@@ -262,13 +262,22 @@ Again, if any changes can't be applied, they are just discarded.
 
 Connection and reconnection to the server is handled inside the FileSystem object, as follows:
 
- * When we are in a disconnected state
-  - writeFile and commit fail with an exception.
-  - openFile on a file that we have not already opened fails with an exception.
-  -  openFile on an already open file succeeds, and a synthetic file_opened event is generated locally.
- * On reconnection, all open files are reopened, and the file_opened events are locally transformed into file_updated events, if the received content differs from the last received content
+ * The initial state of the FileSystem object is DISCONNECTED
+ * When we attempt to connect, the state changes to CONNECTING and then if it succeeds, CONNECTED
+ * A promise member in the fs object is used to make multiple simultaneous calls to connect() work properly
+ * If a connection attempt fails, or the socket is disconnected, the state changes to RECONNECT_WAIT
+ * In the DISCONNECTED or RECONNECT_WAIT state, the connection is attempted:
+    - Automatically, if writeFile()/commit()/openFile() are called
+    - Manually, if fs.connect() is called [meant to be hooked up to a UI "connect now" for the RECONECT_WAIT STATE]
+ * In the RECONNECT_WAIT state, the connection is also attemted to be reconnected with automatically with exponential back-off (starting 5s, doubling, limit 5m)
 
-The FileSystem object also has the ability to add a listener for the state (disconnected, connecting, connected), that is used to indicate in the UI that the connection has been lost.
+The following additional behaviors exist:
+
+ * If the connection inside writeFile/commit/openFile fails, the operation fails with an exception
+ * openFile on an already open file always succeeds - a synthetic file_opened event is generated locally.
+ * On reconnection, all file_open commands are sent for all open files, and the file_opened events are locally transformed into file_updated events, if the received content differs from the last received content
+
+The FileSystem object also has the ability to add a listener for the state (disconnected, connecting, reconnect_wait, connected), that is used to indicate in the UI that the connection has been lost.
 
 == Server internals
 
@@ -443,15 +452,20 @@ and notify if necessary.
   - Synthetic file_opened events for subsequent opens
   - Event distribution system with per-opener queues
 
-**Phase 6c: Advanced Client Features** 🚧 TODO
-- Client-side file synchronization algorithm (standard mode and during-save mode)
+**Phase 6c: Connected states and reconnection** 🚧 TODO
+- Write test cases for handling connection failure and reconnection
+- Fix connection state machine to match current design (disconnected/connecting/connected/reconnect_wait)
+- Handle multiple simulataneous calls to connect()
 - Automatic reconnection handling with exponential backoff
-- File state synchronization on reconnect using cached content
+- Reestablishment of open files on reconnect with correct change notification
+
+**Phase 6d: Advanced Client Features** 🚧 TODO
+- Client-side file synchronization algorithm (standard mode and during-save mode)
 - Advanced error handling and connection state management
 - Comprehensive error recovery and retry mechanisms
 - Expand unit test coverage for all advanced client functionality
 
-**Phase 6d: React Integration** 🚧 TODO
+**Phase 7: React Integration** 🚧 TODO
 - Integrate TypeScript FileSystem with React application
 - Create React hooks for file operations (useFile, useFileSystem)
 - Replace existing /api/files/TASKS.md REST API usage with WebSocket protocol
