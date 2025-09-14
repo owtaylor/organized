@@ -44,6 +44,9 @@ class FileSystem {
   private stateListeners: Set<StateListener> = new Set();
   private pendingCommands: PendingCommand[] = []; // FIFO queue for command responses
   private openFiles: Map<string, OpenFile> = new Map(); // Track open files and their generators
+  private connectionPromise: Promise<void> | null = null; // Track ongoing connection attempts
+  private reconnectTimeoutId: number | null = null; // Track active reconnection timeout
+  private reconnectDelay: number = 5000; // Start with 5 seconds
 
   constructor(url: string) {
     this.url = url;
@@ -57,35 +60,58 @@ class FileSystem {
   }
 
   private connect(): Promise<void> {
-    return new Promise((resolve, reject) => {
-      if (this.state === FileSystemState.CONNECTED) {
-        resolve();
-        return;
-      }
+    // If already connected, return resolved promise
+    if (this.state === FileSystemState.CONNECTED) {
+      return Promise.resolve();
+    }
 
+    // If connection is already in progress, return the existing promise
+    if (this.connectionPromise) {
+      return this.connectionPromise;
+    }
+
+    // Clear any pending reconnection timeout
+    if (this.reconnectTimeoutId) {
+      clearTimeout(this.reconnectTimeoutId);
+      this.reconnectTimeoutId = null;
+    }
+
+    // Create new connection promise
+    this.connectionPromise = new Promise<void>((resolve, reject) => {
       this.setState(FileSystemState.CONNECTING);
 
       try {
         this.ws = new WebSocket(this.url);
 
-        this.ws.onopen = () => {
+        this.ws.onopen = async () => {
           this.setState(FileSystemState.CONNECTED);
+          this.reconnectDelay = 5000; // Reset reconnect delay on successful connection
+
+          // Reestablish open files on reconnection
+          await this.reestablishOpenFiles();
+
+          this.connectionPromise = null;
           resolve();
         };
 
         this.ws.onclose = () => {
-          this.setState(FileSystemState.DISCONNECTED);
           this.ws = null;
+          this.connectionPromise = null;
+
           // Reject all pending commands
           this.pendingCommands.forEach(({ reject }) => {
             reject(new ConnectionClosedError("Connection closed"));
           });
           this.pendingCommands.length = 0;
+
+          // Start reconnection process
+          this.startReconnection();
         };
 
         this.ws.onerror = (event) => {
-          this.setState(FileSystemState.DISCONNECTED);
           this.ws = null;
+          this.connectionPromise = null;
+
           reject(
             new FileSystemError(
               "WebSocket connection failed",
@@ -93,13 +119,16 @@ class FileSystem {
               event as any,
             ),
           );
+
+          // Start reconnection process
+          this.startReconnection();
         };
 
         this.ws.onmessage = (event) => {
           this.handleMessage(event.data);
         };
       } catch (error) {
-        this.setState(FileSystemState.DISCONNECTED);
+        this.connectionPromise = null;
         reject(
           new FileSystemError(
             "Failed to create WebSocket",
@@ -107,8 +136,60 @@ class FileSystem {
             error as Error,
           ),
         );
+
+        // Start reconnection process
+        this.startReconnection();
       }
     });
+
+    return this.connectionPromise;
+  }
+
+  private startReconnection() {
+    // Only start reconnection if we have open files
+    if (this.openFiles.size === 0) {
+      this.setState(FileSystemState.DISCONNECTED);
+      return;
+    }
+
+    this.setState(FileSystemState.RECONNECT_WAIT);
+
+    // Schedule automatic reconnection with exponential backoff
+    this.reconnectTimeoutId = setTimeout(() => {
+      this.reconnectTimeoutId = null;
+
+      // Try to reconnect
+      this.connect().catch(() => {
+        // Connection failed, increase delay and try again
+        this.reconnectDelay = Math.min(this.reconnectDelay * 2, 300000); // Cap at 5 minutes
+        this.startReconnection();
+      });
+    }, this.reconnectDelay) as any;
+  }
+
+  private async reestablishOpenFiles() {
+    if (this.openFiles.size === 0) {
+      return;
+    }
+
+    // Send open_file commands for all currently open files that have active openers
+    for (const [path, openFile] of this.openFiles) {
+      // Skip files that have no openers (they're in the process of being opened)
+      if (openFile.openers.size === 0) {
+        continue;
+      }
+
+      const command: OpenFileCommand = {
+        type: "open_file",
+        path,
+      };
+
+      this.sendCommand(command).catch((error) => {
+        // FIXME: Handle file reestablishment failure (file might no longer exist, etc.)
+        // This needs better error handling architecture for reconnection scenarios
+        console.warn(`Failed to reestablish file ${path}:`, error);
+      });
+    }
   }
 
   private handleMessage(data: string) {
@@ -158,22 +239,35 @@ class FileSystem {
   }
 
   private handleFileEvent(event: FileEvent) {
-    console.log(`Handling file event: ${event.type} for ${event.path}`);
     const openFile = this.openFiles.get(event.path);
     if (!openFile) {
       console.warn(`Received file event for unopened file: ${event.path}`);
       return; // File not open, ignore event
     }
 
+    // Transform file_opened events to file_updated on reconnection since all openers
+    // have already seen synthetic file_opened events
+    let eventToSend = event;
+    if (event.type === "file_opened" && openFile.openers.size > 0) {
+      // Optimization: if content hasn't changed, don't send event
+      if (openFile.lastContent === event.content) {
+        return;
+      }
+
+      eventToSend = {
+        type: "file_updated",
+        path: event.path,
+        content: event.content,
+      };
+    }
+
     // Update cached content
     openFile.lastContent = event.content;
 
     // Add event to all opener queues and resolve pending promises
-    console.log(`Distributing event to ${openFile.openers.size} openers`);
     for (const opener of openFile.openers) {
-      console.log(`Adding event to opener queue: ${opener.id}`);
       const wasEmpty = opener.eventQueue.length === 0;
-      opener.eventQueue.push(event);
+      opener.eventQueue.push(eventToSend);
 
       // If queue was empty and we have a pending promise, resolve it
       if (wasEmpty && opener.resolvePending) {
@@ -261,6 +355,11 @@ class FileSystem {
 
   getState(): FileSystemState {
     return this.state;
+  }
+
+  // Public connect method for manual connection attempts
+  async connectNow(): Promise<void> {
+    return this.connect();
   }
 
   async *openFile(path: string): AsyncGenerator<FileEvent> {
@@ -367,11 +466,8 @@ class FileSystem {
       const events = [...opener.eventQueue];
       opener.eventQueue.length = 0; // Clear the queue
 
-      console.log(`Generator: Found ${events.length} events in queue`);
-
       // Yield any events we have
       for (const event of events) {
-        console.log(`Generator: Yielding event ${event.type}`);
         yield event;
       }
 
@@ -381,7 +477,10 @@ class FileSystem {
       }
 
       // No events available, wait for more
-      if (this.state === FileSystemState.DISCONNECTED) {
+      if (
+        this.state === FileSystemState.DISCONNECTED ||
+        this.state === FileSystemState.RECONNECT_WAIT
+      ) {
         throw new FileSystemError("Connection lost");
       }
 
@@ -390,7 +489,6 @@ class FileSystem {
         opener.resolvePending = resolve;
       });
 
-      console.log("Generator: Waiting for new events...");
       await opener.pendingPromise;
       opener.pendingPromise = null;
     }
@@ -429,6 +527,15 @@ class FileSystem {
   }
 
   disconnect(): void {
+    // Clear any pending reconnection timeout
+    if (this.reconnectTimeoutId) {
+      clearTimeout(this.reconnectTimeoutId);
+      this.reconnectTimeoutId = null;
+    }
+
+    // Clear connection promise
+    this.connectionPromise = null;
+
     // Reject all pending opener promises
     for (const openFile of this.openFiles.values()) {
       for (const opener of openFile.openers) {

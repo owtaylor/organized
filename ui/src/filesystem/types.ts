@@ -79,6 +79,7 @@ export enum FileSystemState {
   CONNECTING = "CONNECTING",
   CONNECTED = "CONNECTED",
   DISCONNECTED = "DISCONNECTED",
+  RECONNECT_WAIT = "RECONNECT_WAIT",
 }
 
 // FileSystem error types

@@ -927,4 +927,340 @@ describe("FileSystem", () => {
       await notesIterator.return(undefined);
     });
   });
+
+  describe("Phase 6c: Connection states and reconnection", () => {
+    it("should handle multiple simultaneous connect() calls", async () => {
+      await Promise.all([
+        // Client operations
+        (async () => {
+          const writePromise1 = fs.writeFile("file1.txt", "old1", "new1");
+          const writePromise2 = fs.writeFile("file2.txt", "old2", "new2");
+          const commitPromise = fs.commit("Test commit");
+
+          // All promises should resolve
+          expect(await writePromise1).toBe("new1");
+          expect(await writePromise2).toBe("new2");
+          await expect(commitPromise).resolves.toBeUndefined();
+
+          expect(fs.getState()).toBe(FileSystemState.CONNECTED);
+        })(),
+
+        // Server responses
+        (async () => {
+          await server.connected;
+
+          // Handle commands in order
+          await expect(server).toReceiveMessage({
+            type: "write_file",
+            path: "file1.txt",
+            last_content: "old1",
+            new_content: "new1",
+          });
+
+          server.send({
+            type: "file_written",
+            path: "file1.txt",
+            content: "new1",
+          });
+
+          await expect(server).toReceiveMessage({
+            type: "write_file",
+            path: "file2.txt",
+            last_content: "old2",
+            new_content: "new2",
+          });
+
+          server.send({
+            type: "file_written",
+            path: "file2.txt",
+            content: "new2",
+          });
+
+          await expect(server).toReceiveMessage({
+            type: "commit",
+            message: "Test commit",
+          });
+
+          server.send({
+            type: "committed",
+          });
+        })(),
+      ]);
+    });
+
+    it("should transition to RECONNECT_WAIT on connection loss with open files", async () => {
+      // Open a file first
+      const fileIterator = fs.openFile("TASKS.md");
+
+      await Promise.all([
+        fileIterator.next(),
+        (async () => {
+          await server.connected;
+          await expect(server).toReceiveMessage({
+            type: "open_file",
+            path: "TASKS.md",
+          });
+          server.send({
+            type: "file_opened",
+            path: "TASKS.md",
+            content: "Initial content",
+          });
+        })(),
+      ]);
+
+      expect(fs.getState()).toBe(FileSystemState.CONNECTED);
+
+      // Close connection
+      server.close();
+
+      // Should transition to RECONNECT_WAIT (not DISCONNECTED) because file is open
+      await new Promise(resolve => setTimeout(resolve, 10)); // Give state change time
+      expect(fs.getState()).toBe(FileSystemState.RECONNECT_WAIT);
+
+      // Clean up
+      await fileIterator.return(undefined);
+    });
+
+    it("should transition to DISCONNECTED on connection loss without open files", async () => {
+      // Make a simple operation without keeping files open
+      const writePromise = fs.writeFile("test.txt", "old", "new");
+
+      await server.connected;
+      await expect(server).toReceiveMessage({
+        type: "write_file",
+        path: "test.txt",
+        last_content: "old",
+        new_content: "new",
+      });
+
+      expect(fs.getState()).toBe(FileSystemState.CONNECTED);
+
+      // Close connection before sending response
+      server.close();
+
+      await expect(writePromise).rejects.toThrow("Connection closed");
+
+      // Should transition to DISCONNECTED (not RECONNECT_WAIT) because no files are open
+      expect(fs.getState()).toBe(FileSystemState.DISCONNECTED);
+    });
+
+    it("should reestablish open files on reconnection", async () => {
+      const fileIterator = fs.openFile("TASKS.md");
+
+      // Initial connection and file opening
+      await Promise.all([
+        fileIterator.next(),
+        (async () => {
+          await server.connected;
+          await expect(server).toReceiveMessage({
+            type: "open_file",
+            path: "TASKS.md",
+          });
+          server.send({
+            type: "file_opened",
+            path: "TASKS.md",
+            content: "v1",
+          });
+        })(),
+      ]);
+
+      // Simulate connection loss
+      server.close();
+      server = new WS(WS_URL, { jsonProtocol: true });
+
+      // Manual reconnection
+      const connectPromise = fs.connectNow();
+
+      await Promise.all([
+        connectPromise,
+        (async () => {
+          await server.connected;
+
+          // Should receive reestablishment command for open file
+          await expect(server).toReceiveMessage({
+            type: "open_file",
+            path: "TASKS.md",
+          });
+
+          server.send({
+            type: "file_opened",
+            path: "TASKS.md",
+            content: "v2", // Content changed
+          });
+        })(),
+      ]);
+
+      // Should receive file_updated event (not file_opened) since content changed
+      const { value: updateEvent } = await fileIterator.next();
+      expect(updateEvent).toEqual({
+        type: "file_updated",
+        path: "TASKS.md",
+        content: "v2",
+      });
+
+      await fileIterator.return(undefined);
+    });
+
+    it("should not send file_updated on reconnection if content unchanged", async () => {
+      const fileIterator = fs.openFile("TASKS.md");
+
+      // Initial connection and file opening
+      await Promise.all([
+        fileIterator.next(),
+        (async () => {
+          await server.connected;
+          await expect(server).toReceiveMessage({
+            type: "open_file",
+            path: "TASKS.md",
+          });
+          server.send({
+            type: "file_opened",
+            path: "TASKS.md",
+            content: "unchanged",
+          });
+        })(),
+      ]);
+
+      // Simulate connection loss
+      server.close();
+      server = new WS(WS_URL, { jsonProtocol: true });
+
+      // Manual reconnection
+      const connectPromise = fs.connectNow();
+
+      await Promise.all([
+        connectPromise,
+        (async () => {
+          await server.connected;
+
+          // Should receive reestablishment command for open file
+          await expect(server).toReceiveMessage({
+            type: "open_file",
+            path: "TASKS.md",
+          });
+
+          server.send({
+            type: "file_opened",
+            path: "TASKS.md",
+            content: "unchanged", // Same content
+          });
+        })(),
+      ]);
+
+      // Should NOT receive any new events
+      // Send another event to verify the generator is still working
+      server.send({
+        type: "file_updated",
+        path: "TASKS.md",
+        content: "actually changed",
+      });
+
+      const { value: updateEvent } = await fileIterator.next();
+      expect(updateEvent).toEqual({
+        type: "file_updated",
+        path: "TASKS.md",
+        content: "actually changed",
+      });
+
+      await fileIterator.return(undefined);
+    });
+
+    it("should provide public connectNow() method", async () => {
+      expect(fs.getState()).toBe(FileSystemState.DISCONNECTED);
+
+      const connectPromise = fs.connectNow();
+
+      await server.connected;
+      await connectPromise;
+
+      expect(fs.getState()).toBe(FileSystemState.CONNECTED);
+    });
+
+    it("should handle file reestablishment failures gracefully", async () => {
+      const fileIterator = fs.openFile("TASKS.md");
+
+      // Initial connection and file opening
+      await Promise.all([
+        fileIterator.next(),
+        (async () => {
+          await server.connected;
+          await expect(server).toReceiveMessage({
+            type: "open_file",
+            path: "TASKS.md",
+          });
+          server.send({
+            type: "file_opened",
+            path: "TASKS.md",
+            content: "content",
+          });
+        })(),
+      ]);
+
+      // Simulate connection loss
+      server.close();
+      server = new WS(WS_URL, { jsonProtocol: true });
+
+      // Manual reconnection with file error
+      const connectPromise = fs.connectNow();
+
+      await Promise.all([
+        connectPromise,
+        (async () => {
+          await server.connected;
+
+          // Should receive reestablishment command
+          await expect(server).toReceiveMessage({
+            type: "open_file",
+            path: "TASKS.md",
+          });
+
+          // Send error response (file might have been deleted)
+          server.send({
+            type: "error",
+            path: "TASKS.md",
+            message: "File not found",
+          });
+        })(),
+      ]);
+
+      // Connection should still be successful despite file error
+      expect(fs.getState()).toBe(FileSystemState.CONNECTED);
+
+      await fileIterator.return(undefined);
+    });
+
+    it("should clear reconnection timeout on manual disconnect", async () => {
+      const fileIterator = fs.openFile("TASKS.md");
+
+      // Initial connection and file opening
+      await Promise.all([
+        fileIterator.next(),
+        (async () => {
+          await server.connected;
+          await expect(server).toReceiveMessage({
+            type: "open_file",
+            path: "TASKS.md",
+          });
+          server.send({
+            type: "file_opened",
+            path: "TASKS.md",
+            content: "content",
+          });
+        })(),
+      ]);
+
+      // Close connection to trigger reconnection state
+      server.close();
+
+      // Give time for RECONNECT_WAIT state
+      await new Promise(resolve => setTimeout(resolve, 10));
+      expect(fs.getState()).toBe(FileSystemState.RECONNECT_WAIT);
+
+      // Manual disconnect should clear timeouts and go to DISCONNECTED
+      fs.disconnect();
+      expect(fs.getState()).toBe(FileSystemState.DISCONNECTED);
+
+      await fileIterator.return(undefined);
+    });
+  });
 });

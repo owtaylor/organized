@@ -452,12 +452,12 @@ and notify if necessary.
   - Synthetic file_opened events for subsequent opens
   - Event distribution system with per-opener queues
 
-**Phase 6c: Connected states and reconnection** 🚧 TODO
-- Write test cases for handling connection failure and reconnection
-- Fix connection state machine to match current design (disconnected/connecting/connected/reconnect_wait)
-- Handle multiple simulataneous calls to connect()
-- Automatic reconnection handling with exponential backoff
-- Reestablishment of open files on reconnect with correct change notification
+**Phase 6c: Connected states and reconnection** ✅ COMPLETED
+- Added RECONNECT_WAIT state and proper state transitions based on open files
+- Connection promise management prevents multiple simultaneous connect() calls
+- Exponential backoff reconnection (5s start, doubling, 5m limit)
+- File reestablishment on reconnect with content change detection
+- Public connectNow() method and comprehensive test coverage (8 tests)
 
 **Phase 6d: Advanced Client Features** 🚧 TODO
 - Client-side file synchronization algorithm (standard mode and during-save mode)
