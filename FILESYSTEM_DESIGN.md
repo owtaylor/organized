@@ -380,6 +380,46 @@ To read the committed versions of files, we read and track changes to .git/HEAD 
 When the ref changes, we read open files from that revision using `git cat-file blob <rev>:<path>`
 and notify if necessary.
 
+== PROTOCOL AND CLIENT API REVISION
+
+The current design causes a lot of complexity on the client side around managing
+opening the same file multiple times, especially on reconnection. If we treat
+multiple opens of the same file as independent, things get a lot simpler.
+
+To this end:
+
+Add a "handle" argument (an arbitrary opaque string) to `file_open`/`file_close`.
+This is sent back in the `file_opened` event, and also in each `file_updated` call.
+The reference counting in the protocol is removed - the handle must be unique for
+each file_open call, and you can only call `file_close` once per each handle.
+
+The "handle" argument is also included with `write_file` - so `write_file` can now only
+be called for an open file - and with the `file_written` response. The handle passed to
+`write_file` only the `file_written` response, but if the file is separately open with
+a different handle, *that* handle will see `file_updated`.
+
+THe client API is changed to match in the following way:
+
+ * openFile now returns a File object
+ * The File object now has `async *getEvents(): AsyncGenerator<FileEvent>'
+ * The File object also has `async writeFile(newContent: string): Promise<string>`
+
+The FileSystem Python API should not need many changes - it will keep the current
+reference counting. One change that will be helpful - replace the exclude_watcher
+parameter to write_file with:
+
+  source: tuple[FileSystemWatcher, str] | None = None
+
+and `_notify_watchers` does something like:
+
+```python
+        for watcher in self.watchers:
+            if source is not None and watcher = source[0]:
+                watcher.on_file_change(filename, content, source[1])
+            else:
+                watcher.on_file_change(filename, content, None)
+```
+
 == Implementation Plan
 
 **Phase 1: Basic FileSystem** ✅ COMPLETED
@@ -459,17 +499,17 @@ and notify if necessary.
 - File reestablishment on reconnect with content change detection
 - Public connectNow() method and comprehensive test coverage (8 tests)
 
-**Phase 6d: Advanced Client Features** 🚧 TODO
-- Client-side file synchronization algorithm (standard mode and during-save mode)
-- Advanced error handling and connection state management
-- Comprehensive error recovery and retry mechanisms
-- Expand unit test coverage for all advanced client functionality
+**Phase 7: Protocol and Client Revision** 🚧 TODO
+- Update tests/test_file_system.py and tests/test_file_websocket.py
+- Update the Python server implementation
+- Update ui/src/index.test.ts
+- Update the client implemetation
+- Incorporate the changes from "PROTOCOL AND CLIENT API REVISION" section into the
+  body of FILESYSTEM_DESIGN.md and delete the revsion section.
 
-**Phase 7: React Integration** 🚧 TODO
+**Phase 8: React Integration** 🚧 TODO
 - Integrate TypeScript FileSystem with React application
-- Create React hooks for file operations (useFile, useFileSystem)
-- Replace existing /api/files/TASKS.md REST API usage with WebSocket protocol
-- Implement real-time collaborative editing support
-- Handle UI state updates from file_updated events
-- Error boundary and loading state management
-- Integration testing with the full stack
+- Keep a FileSystem object at the top of the application using the react context API
+- Create a new editor component that uses the Fi    leSystem API to edit a particular
+  file.
+- Replace existing /api/files/TASKS.md editor with the new editor component
