@@ -76,16 +76,18 @@ class TestOpenFileCommand:
         # Create a test file
         test_file = git_repo / "TASKS.md"
         test_file.write_text("# Test Tasks\n\nHello world")
-        
+
         with client.websocket_connect("/ws") as websocket:
             websocket.send_json({
                 "type": "open_file",
-                "path": "TASKS.md"
+                "path": "TASKS.md",
+                "handle": "handle1"
             })
-            
+
             response = websocket.receive_json()
             assert response["type"] == "file_opened"
             assert response["path"] == "TASKS.md"
+            assert response["handle"] == "handle1"
             assert response["content"] == "# Test Tasks\n\nHello world"
 
     def test_open_nonexistent_file_returns_error(self, client):
@@ -93,21 +95,36 @@ class TestOpenFileCommand:
         with client.websocket_connect("/ws") as websocket:
             websocket.send_json({
                 "type": "open_file",
-                "path": "nonexistent.md"
+                "path": "nonexistent.md",
+                "handle": "handle1"
             })
-            
+
             response = websocket.receive_json()
             assert response["type"] == "error"
             assert response["path"] == "nonexistent.md"
+
+    def test_open_file_missing_handle_returns_error(self, client):
+        """Test that open_file without handle returns error."""
+        with client.websocket_connect("/ws") as websocket:
+            websocket.send_json({
+                "type": "open_file",
+                "path": "test.md"
+                # Missing "handle" field
+            })
+
+            response = websocket.receive_json()
+            assert response["type"] == "error"
+            assert "Missing required field: handle" in response["message"]
 
     def test_open_file_missing_path_returns_error(self, client):
         """Test that open_file without path returns error."""
         with client.websocket_connect("/ws") as websocket:
             websocket.send_json({
-                "type": "open_file"
+                "type": "open_file",
+                "handle": "handle1"
                 # Missing "path" field
             })
-            
+
             response = websocket.receive_json()
             assert response["type"] == "error"
             assert "Missing required field: path" in response["message"]
@@ -119,19 +136,21 @@ class TestOpenFileCommand:
         test_file.write_text("committed content")
         subprocess.run(["git", "add", "committed.md"], cwd=git_repo, check=True)
         subprocess.run(["git", "commit", "-m", "Add committed file"], cwd=git_repo, check=True)
-        
+
         # Modify the file after commit
         test_file.write_text("modified content")
-        
+
         with client.websocket_connect("/ws") as websocket:
             websocket.send_json({
                 "type": "open_file",
-                "path": "@committed.md"
+                "path": "@committed.md",
+                "handle": "handle1"
             })
-            
+
             response = websocket.receive_json()
             assert response["type"] == "file_opened"
             assert response["path"] == "@committed.md"
+            assert response["handle"] == "handle1"
             assert response["content"] == "committed content"
 
 
@@ -142,36 +161,49 @@ class TestCloseFileCommand:
         """Test closing an opened file returns file_closed event."""
         test_file = git_repo / "test.md"
         test_file.write_text("test content")
-        
+
         with client.websocket_connect("/ws") as websocket:
             # First open the file
             websocket.send_json({
                 "type": "open_file",
-                "path": "test.md"
+                "path": "test.md",
+                "handle": "handle1"
             })
             websocket.receive_json()  # Skip file_opened event
-            
+
             # Now close the file
             websocket.send_json({
                 "type": "close_file",
-                "path": "test.md"
+                "handle": "handle1"
             })
-            
+
             response = websocket.receive_json()
             assert response["type"] == "file_closed"
-            assert response["path"] == "test.md"
+            assert response["handle"] == "handle1"
 
-    def test_close_file_missing_path_returns_error(self, client):
-        """Test that close_file without path returns error."""
+    def test_close_file_missing_handle_returns_error(self, client):
+        """Test that close_file without handle returns error."""
         with client.websocket_connect("/ws") as websocket:
             websocket.send_json({
                 "type": "close_file"
-                # Missing "path" field
+                # Missing "handle" field
             })
-            
+
             response = websocket.receive_json()
             assert response["type"] == "error"
-            assert "Missing required field: path" in response["message"]
+            assert "Missing required field: handle" in response["message"]
+
+    def test_close_invalid_handle_returns_error(self, client):
+        """Test that closing an invalid handle returns error."""
+        with client.websocket_connect("/ws") as websocket:
+            websocket.send_json({
+                "type": "close_file",
+                "handle": "invalid_handle"
+            })
+
+            response = websocket.receive_json()
+            assert response["type"] == "error"
+            assert "Invalid handle" in response["message"]
 
 
 class TestWriteFileCommand:
@@ -181,41 +213,56 @@ class TestWriteFileCommand:
         """Test writing to an opened file returns file_written event."""
         test_file = git_repo / "test.md"
         test_file.write_text("original content")
-        
+
         with client.websocket_connect("/ws") as websocket:
             # First open the file
             websocket.send_json({
                 "type": "open_file",
-                "path": "test.md"
+                "path": "test.md",
+                "handle": "handle1"
             })
             websocket.receive_json()  # Skip file_opened event
-            
+
             # Now write to the file
             websocket.send_json({
                 "type": "write_file",
-                "path": "test.md",
+                "handle": "handle1",
                 "last_content": "original content",
                 "new_content": "updated content"
             })
-            
+
             response = websocket.receive_json()
             assert response["type"] == "file_written"
-            assert response["path"] == "test.md"
+            assert response["handle"] == "handle1"
             assert response["content"] == "updated content"
 
-    def test_write_file_missing_path_returns_error(self, client):
-        """Test that write_file without path returns error."""
+    def test_write_file_missing_handle_returns_error(self, client):
+        """Test that write_file without handle returns error."""
         with client.websocket_connect("/ws") as websocket:
             websocket.send_json({
                 "type": "write_file",
                 "last_content": "test",
                 "new_content": "test2"
-                # Missing "path" field
+                # Missing "handle" field
             })
-            
+
             response = websocket.receive_json()
             assert response["type"] == "error"
-            assert "Missing required field: path" in response["message"]
+            assert "Missing required field: handle" in response["message"]
+
+    def test_write_file_invalid_handle_returns_error(self, client):
+        """Test that write_file with invalid handle returns error."""
+        with client.websocket_connect("/ws") as websocket:
+            websocket.send_json({
+                "type": "write_file",
+                "handle": "invalid_handle",
+                "last_content": "test",
+                "new_content": "test2"
+            })
+
+            response = websocket.receive_json()
+            assert response["type"] == "error"
+            assert "Invalid handle" in response["message"]
 
 
 class TestCommitCommand:
@@ -249,43 +296,83 @@ class TestCommitCommand:
             assert "Missing required field: message" in response["message"]
 
 
-class TestConnectionReferenceTracking:
-    """Test per-connection reference counting."""
+class TestHandleBasedFileManagement:
+    """Test handle-based file management."""
 
-    def test_multiple_opens_require_multiple_closes(self, client, git_repo):
-        """Test that opening a file multiple times requires multiple closes."""
-        test_file = git_repo / "refcount.md"
+    def test_multiple_handles_for_same_file(self, client, git_repo):
+        """Test that multiple handles can be opened for the same file."""
+        test_file = git_repo / "multihandle.md"
         test_file.write_text("test content")
-        
+
         with client.websocket_connect("/ws") as websocket:
-            # Open the file twice
+            # Open the file with first handle
             websocket.send_json({
                 "type": "open_file",
-                "path": "refcount.md"
+                "path": "multihandle.md",
+                "handle": "handle1"
             })
-            websocket.receive_json()  # file_opened event
-            
+            response1 = websocket.receive_json()
+            assert response1["type"] == "file_opened"
+            assert response1["handle"] == "handle1"
+
+            # Open the same file with second handle
             websocket.send_json({
                 "type": "open_file",
-                "path": "refcount.md"
+                "path": "multihandle.md",
+                "handle": "handle2"
             })
-            websocket.receive_json()  # file_opened event
-            
-            # Close the file once
+            response2 = websocket.receive_json()
+            assert response2["type"] == "file_opened"
+            assert response2["handle"] == "handle2"
+
+            # Close first handle
             websocket.send_json({
                 "type": "close_file",
-                "path": "refcount.md"
+                "handle": "handle1"
             })
             response = websocket.receive_json()
             assert response["type"] == "file_closed"
-            
-            # Close again - should still work
+            assert response["handle"] == "handle1"
+
+            # Close second handle
             websocket.send_json({
                 "type": "close_file",
-                "path": "refcount.md"
+                "handle": "handle2"
             })
             response = websocket.receive_json()
             assert response["type"] == "file_closed"
+            assert response["handle"] == "handle2"
+
+    def test_closing_handle_twice_returns_error(self, client, git_repo):
+        """Test that closing the same handle twice returns an error."""
+        test_file = git_repo / "test.md"
+        test_file.write_text("test content")
+
+        with client.websocket_connect("/ws") as websocket:
+            # Open the file
+            websocket.send_json({
+                "type": "open_file",
+                "path": "test.md",
+                "handle": "handle1"
+            })
+            websocket.receive_json()  # file_opened event
+
+            # Close the handle
+            websocket.send_json({
+                "type": "close_file",
+                "handle": "handle1"
+            })
+            response = websocket.receive_json()
+            assert response["type"] == "file_closed"
+
+            # Try to close the same handle again - should error
+            websocket.send_json({
+                "type": "close_file",
+                "handle": "handle1"
+            })
+            response = websocket.receive_json()
+            assert response["type"] == "error"
+            assert "Invalid handle" in response["message"]
 
 
 class TestFileUpdatedEvents:
@@ -296,20 +383,22 @@ class TestFileUpdatedEvents:
         # Create a test file
         test_file = git_repo / "watched.md"
         test_file.write_text("initial content")
-        
+
         with client.websocket_connect("/ws") as websocket:
             # Open the file for watching
             websocket.send_json({
                 "type": "open_file",
-                "path": "watched.md"
+                "path": "watched.md",
+                "handle": "handle1"
             })
             response = websocket.receive_json()
             assert response["type"] == "file_opened"
+            assert response["handle"] == "handle1"
             assert response["content"] == "initial content"
-            
+
             # Simulate external change to the file
             test_file.write_text("externally modified content")
-            
+
             # Should receive file_updated event
             # NOTE: This will hang if file watching is not working properly.
             # websocket.receive_json() blocks until a message is received.
@@ -317,8 +406,87 @@ class TestFileUpdatedEvents:
             # a request to add timeout support to receive_json().
             response = websocket.receive_json()
             assert response["type"] == "file_updated"
-            assert response["path"] == "watched.md"
+            assert response["handle"] == "handle1"
             assert response["content"] == "externally modified content"
+
+    def test_file_updated_sent_to_multiple_handles(self, client, git_repo):
+        """Test that file_updated events are sent to all open handles for a file."""
+        test_file = git_repo / "multiwatch.md"
+        test_file.write_text("initial content")
+
+        with client.websocket_connect("/ws") as websocket:
+            # Open the file with multiple handles
+            websocket.send_json({
+                "type": "open_file",
+                "path": "multiwatch.md",
+                "handle": "handle1"
+            })
+            response1 = websocket.receive_json()
+            assert response1["type"] == "file_opened"
+            assert response1["handle"] == "handle1"
+
+            websocket.send_json({
+                "type": "open_file",
+                "path": "multiwatch.md",
+                "handle": "handle2"
+            })
+            response2 = websocket.receive_json()
+            assert response2["type"] == "file_opened"
+            assert response2["handle"] == "handle2"
+
+            # Simulate external change to the file
+            test_file.write_text("externally modified content")
+
+            # Should receive file_updated events for both handles
+            events_received = []
+            for _ in range(2):
+                response = websocket.receive_json()
+                assert response["type"] == "file_updated"
+                assert response["content"] == "externally modified content"
+                events_received.append(response["handle"])
+
+            # Both handles should have received updates
+            assert "handle1" in events_received
+            assert "handle2" in events_received
+
+    def test_file_written_only_sent_to_writing_handle(self, client, git_repo):
+        """Test that file_written events are only sent to the writing handle."""
+        test_file = git_repo / "writetest.md"
+        test_file.write_text("initial content")
+
+        with client.websocket_connect("/ws") as websocket:
+            # Open the file with multiple handles
+            websocket.send_json({
+                "type": "open_file",
+                "path": "writetest.md",
+                "handle": "handle1"
+            })
+            websocket.receive_json()  # file_opened
+
+            websocket.send_json({
+                "type": "open_file",
+                "path": "writetest.md",
+                "handle": "handle2"
+            })
+            websocket.receive_json()  # file_opened
+
+            # Write to the file using handle1
+            websocket.send_json({
+                "type": "write_file",
+                "handle": "handle1",
+                "last_content": "initial content",
+                "new_content": "updated content"
+            })
+
+            # Should receive file_written for handle1 and file_updated for handle2
+            events_received = []
+            for _ in range(2):
+                response = websocket.receive_json()
+                events_received.append((response["type"], response["handle"]))
+
+            # Verify we got the right events for the right handles
+            assert ("file_written", "handle1") in events_received
+            assert ("file_updated", "handle2") in events_received
 
 
 class TestErrorHandling:

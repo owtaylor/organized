@@ -11,9 +11,12 @@ import {
   CommittedEvent,
   OpenFileCommand,
   CloseFileCommand,
+  File,
+  FileOpenedEvent,
+  FileUpdatedEvent,
 } from "./types.js";
 
-export type { FileEvent, FileSystemState };
+export type { FileEvent, FileSystemState, File };
 export { FileSystemError };
 
 type StateListener = (state: FileSystemState) => void;
@@ -23,18 +26,137 @@ interface PendingCommand {
   reject: (error: Error) => void;
 }
 
-interface FileOpener {
-  eventQueue: FileEvent[];
-  pendingPromise: Promise<void> | null;
-  resolvePending: (() => void) | null;
-}
+class FileImpl implements File {
+  private eventQueue: FileEvent[] = [];
+  private pendingResolver: (() => void) | null = null;
+  private closed = false;
+  private _lastContent = ""; // Last received content from server (not last delivered to client)
+  private openPromise: Promise<void>;
+  private hasBeenOpened = false;
+  private getEventsCalled = false;
 
-interface OpenFile {
-  path: string;
-  refCount: number;
-  lastContent: string;
-  opening: Promise<void> | null; // Promise that resolves when file is opened, null when open
-  openers: Set<FileOpener>; // Each generator gets its own opener with separate event queue
+  constructor(
+    private fileSystem: FileSystem,
+    public readonly path: string,
+    private handle: string,
+  ) {
+    // Start opening the file immediately
+    this.openPromise = this.fileSystem
+      ._openFile(path, handle)
+      .catch((error) => {
+        this.fileSystem._removeFile(handle);
+        throw error;
+      });
+  }
+
+  async *getEvents(): AsyncGenerator<FileEvent> {
+    if (this.getEventsCalled) {
+      throw new FileSystemError("getEvents() can only be called once per file");
+    }
+    this.getEventsCalled = true;
+
+    // Wait for file to be opened first
+    await this.openPromise;
+
+    while (!this.closed) {
+      // If we have queued events, yield the first one
+      if (this.eventQueue.length > 0) {
+        const event = this.eventQueue.shift()!;
+        yield event;
+        continue;
+      }
+
+      // If we're closed, stop
+      if (this.closed) {
+        break;
+      }
+
+      // Wait for the next event
+      await new Promise<void>((resolve) => {
+        this.pendingResolver = resolve;
+      });
+    }
+  }
+
+  // Add an event to this file's queue
+  _addEvent(event: FileEvent) {
+    if (this.closed) return;
+
+    let processedEvent: FileEvent | null = event;
+
+    // Smart event processing
+    if (event.type === "file_opened") {
+      if (!this.hasBeenOpened) {
+        // First file_opened event - always deliver
+        this.hasBeenOpened = true;
+      } else {
+        // Subsequent file_opened events should become file_updated
+        processedEvent = {
+          type: "file_updated",
+          handle: event.handle,
+          content: event.content,
+        };
+      }
+    }
+
+    // Skip file_updated events that don't change content
+    if (
+      processedEvent &&
+      processedEvent.type === "file_updated" &&
+      processedEvent.content === this._lastContent
+    ) {
+      return; // Skip this event
+    }
+
+    if (processedEvent) {
+      // Update lastContent for duplicate prevention
+      this._lastContent = processedEvent.content;
+
+      this.eventQueue.push(processedEvent);
+
+      // Notify pending generator
+      if (this.pendingResolver) {
+        const resolver = this.pendingResolver;
+        this.pendingResolver = null;
+        resolver();
+      }
+    }
+  }
+
+  async writeFile(oldContent: string, newContent: string): Promise<string> {
+    if (this.closed) {
+      throw new FileSystemError("Cannot write to closed file");
+    }
+
+    return this.fileSystem._writeFile(this.handle, oldContent, newContent);
+  }
+
+  close(): void {
+    if (this.closed) return;
+
+    this.closed = true;
+
+    // Fire-and-forget close operation
+    this.openPromise
+      .then(() => {
+        // File was successfully opened, send close command
+        return this.fileSystem._closeFile(this.handle);
+      })
+      .catch(() => {
+        // File opening failed, just remove from tracking without sending close
+        this.fileSystem._removeFile(this.handle);
+      })
+      .catch((error) => {
+        console.warn(`Failed to close file ${this.handle}:`, error);
+      });
+
+    // Notify pending generator to stop immediately
+    if (this.pendingResolver) {
+      const resolver = this.pendingResolver;
+      this.pendingResolver = null;
+      resolver();
+    }
+  }
 }
 
 class FileSystem {
@@ -43,13 +165,80 @@ class FileSystem {
   private state: FileSystemState = FileSystemState.DISCONNECTED;
   private stateListeners: Set<StateListener> = new Set();
   private pendingCommands: PendingCommand[] = []; // FIFO queue for command responses
-  private openFiles: Map<string, OpenFile> = new Map(); // Track open files and their generators
-  private connectionPromise: Promise<void> | null = null; // Track ongoing connection attempts
-  private reconnectTimeoutId: number | null = null; // Track active reconnection timeout
-  private reconnectDelay: number = 5000; // Start with 5 seconds
+  private openFiles: Map<string, FileImpl> = new Map(); // Track open files by handle
+  private connectionPromise: Promise<void> | null = null;
+  private reconnectTimeoutId: number | null = null;
+  private reconnectDelay: number = 5000;
+  private handleCounter = 0; // Simple counter for generating handles
 
   constructor(url: string) {
     this.url = url;
+  }
+
+  getState(): FileSystemState {
+    return this.state;
+  }
+
+  addStateListener(listener: StateListener): () => void {
+    this.stateListeners.add(listener);
+    // Call immediately with current state
+    listener(this.state);
+
+    return () => {
+      this.stateListeners.delete(listener);
+    };
+  }
+
+  openFile(path: string): File {
+    const handle = String(++this.handleCounter);
+    const file = new FileImpl(this, path, handle);
+    this.openFiles.set(handle, file);
+    return file;
+  }
+
+  async commit(message: string): Promise<void> {
+    const command: CommitCommand = {
+      type: "commit",
+      message,
+    };
+
+    const response = await this.sendCommand(command);
+
+    if (response.type === "committed") {
+      return;
+    }
+
+    if (response.type === "error") {
+      throw new FileSystemError(response.message);
+    }
+
+    throw new FileSystemError(`Unexpected response type: ${response.type}`);
+  }
+
+  async connectNow(): Promise<void> {
+    return this.connect();
+  }
+
+  disconnect(): void {
+    // Clear reconnection timeout
+    if (this.reconnectTimeoutId) {
+      clearTimeout(this.reconnectTimeoutId);
+      this.reconnectTimeoutId = null;
+    }
+
+    // Close WebSocket connection
+    if (this.ws) {
+      this.ws.close();
+      this.ws = null;
+    }
+
+    this.setState(FileSystemState.DISCONNECTED);
+  }
+
+  // Internal methods
+
+  _removeFile(handle: string) {
+    this.openFiles.delete(handle);
   }
 
   private setState(newState: FileSystemState) {
@@ -172,23 +361,23 @@ class FileSystem {
       return;
     }
 
-    // Send open_file commands for all currently open files that have active openers
-    for (const [path, openFile] of this.openFiles) {
-      // Skip files that have no openers (they're in the process of being opened)
-      if (openFile.openers.size === 0) {
-        continue;
+    // Send open_file commands only for files that have actually been opened before
+    // The response will be handled by the normal message flow
+    for (const [handle, file] of this.openFiles) {
+      // Only reestablish files that have been opened previously
+      if ((file as any).hasBeenOpened) {
+        const command: OpenFileCommand = {
+          type: "open_file",
+          path: file.path,
+          handle,
+        };
+
+        try {
+          await this.sendCommand(command);
+        } catch (error) {
+          console.warn(`Failed to reestablish file ${file.path}:`, error);
+        }
       }
-
-      const command: OpenFileCommand = {
-        type: "open_file",
-        path,
-      };
-
-      this.sendCommand(command).catch((error) => {
-        // FIXME: Handle file reestablishment failure (file might no longer exist, etc.)
-        // This needs better error handling architecture for reconnection scenarios
-        console.warn(`Failed to reestablish file ${path}:`, error);
-      });
     }
   }
 
@@ -196,360 +385,133 @@ class FileSystem {
     try {
       const event: ServerEvent = JSON.parse(data);
 
-      // Handle file events that should be sent to generators
+      // Handle file events that should be sent to specific files
       if (
         event.type === "file_opened" ||
         event.type === "file_updated" ||
         event.type === "file_written"
       ) {
-        this.handleFileEvent(event as FileEvent);
+        const fileEvent = event as FileEvent;
+        const file = this.openFiles.get(fileEvent.handle);
 
-        // file_opened and file_written are also responses to commands
-        if (event.type === "file_updated") {
-          return;
+        if (file) {
+          file._addEvent(fileEvent);
         }
-      }
 
-      // All other events are responses to commands - handle FIFO
-      const pendingCommand = this.pendingCommands.shift();
-      if (!pendingCommand) {
-        console.warn("Received server event but no pending command:", event);
+        // If this was in response to a command, also resolve the pending command
+        if (event.type === "file_opened" || event.type === "file_written") {
+          this.resolveCommand(event);
+        }
+
         return;
       }
 
-      if (event.type === "error") {
-        pendingCommand.reject(new FileSystemError(event.message, event.path));
-      } else {
-        pendingCommand.resolve(event);
-      }
+      // Handle other command responses
+      this.resolveCommand(event);
     } catch (error) {
       console.error("Failed to parse WebSocket message:", error);
-      // Reject the first pending command if parsing fails
-      const pendingCommand = this.pendingCommands.shift();
-      if (pendingCommand) {
-        pendingCommand.reject(
-          new FileSystemError(
-            "Failed to parse server response",
-            undefined,
-            error as Error,
-          ),
-        );
-      }
     }
   }
 
-  private handleFileEvent(event: FileEvent) {
-    const openFile = this.openFiles.get(event.path);
-    if (!openFile) {
-      console.warn(`Received file event for unopened file: ${event.path}`);
-      return; // File not open, ignore event
-    }
-
-    // Transform file_opened events to file_updated on reconnection since all openers
-    // have already seen synthetic file_opened events
-    let eventToSend = event;
-    if (event.type === "file_opened" && openFile.openers.size > 0) {
-      // Optimization: if content hasn't changed, don't send event
-      if (openFile.lastContent === event.content) {
-        return;
-      }
-
-      eventToSend = {
-        type: "file_updated",
-        path: event.path,
-        content: event.content,
-      };
-    }
-
-    // Update cached content
-    openFile.lastContent = event.content;
-
-    // Add event to all opener queues and resolve pending promises
-    for (const opener of openFile.openers) {
-      const wasEmpty = opener.eventQueue.length === 0;
-      opener.eventQueue.push(eventToSend);
-
-      // If queue was empty and we have a pending promise, resolve it
-      if (wasEmpty && opener.resolvePending) {
-        opener.resolvePending();
-        opener.resolvePending = null;
-        // Note: pendingPromise will be set to null in createFileGenerator
-      }
+  private resolveCommand(event: ServerEvent) {
+    const pending = this.pendingCommands.shift();
+    if (pending) {
+      pending.resolve(event);
     }
   }
 
-  private async sendCommand(command: ClientCommand): Promise<ServerEvent> {
-    if (this.state !== FileSystemState.CONNECTED) {
-      await this.connect();
-    }
-
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
-      throw new FileSystemError("WebSocket not connected");
-    }
-
-    return new Promise<ServerEvent>((resolve, reject) => {
-      // Add to FIFO queue before sending
-      this.pendingCommands.push({ resolve, reject });
-
+  private sendCommand(command: ClientCommand): Promise<ServerEvent> {
+    return new Promise(async (resolve, reject) => {
       try {
-        this.ws!.send(JSON.stringify(command));
+        // Ensure connection
+        await this.connect();
+
+        if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+          throw new ConnectionClosedError("Connection not available");
+        }
+
+        // Add to pending commands
+        this.pendingCommands.push({ resolve, reject });
+
+        // Send command
+        this.ws.send(JSON.stringify(command));
       } catch (error) {
-        // Remove from queue if send fails
-        this.pendingCommands.pop();
-        reject(
-          new FileSystemError(
-            "Failed to send command",
-            undefined,
-            error as Error,
-          ),
-        );
+        reject(error);
       }
     });
   }
 
-  async writeFile(
-    path: string,
+  async _openFile(path: string, handle: string): Promise<void> {
+    const command: OpenFileCommand = {
+      type: "open_file",
+      path,
+      handle,
+    };
+
+    const response = await this.sendCommand(command);
+
+    if (response.type === "file_opened") {
+      // Event will be handled by handleMessage, don't add it here
+      return;
+    }
+
+    if (response.type === "error") {
+      throw new FileSystemError(response.message, path);
+    }
+
+    throw new FileSystemError(`Unexpected response type: ${response.type}`);
+  }
+
+  async _writeFile(
+    handle: string,
     lastContent: string,
     newContent: string,
   ): Promise<string> {
     const command: WriteFileCommand = {
       type: "write_file",
-      path,
+      handle,
       last_content: lastContent,
       new_content: newContent,
     };
 
-    const event = await this.sendCommand(command);
+    const response = await this.sendCommand(command);
 
-    if (event.type === "file_written") {
-      return (event as FileWrittenEvent).content;
+    if (response.type === "file_written") {
+      const writeResponse = response as FileWrittenEvent;
+      // The file event will be handled by handleMessage and sent to the file
+      return writeResponse.content;
     }
 
-    throw new FileSystemError(`Unexpected response type: ${event.type}`);
-  }
-
-  async commit(message: string): Promise<void> {
-    const command: CommitCommand = {
-      type: "commit",
-      message,
-    };
-
-    const event = await this.sendCommand(command);
-
-    if (event.type === "committed") {
-      return; // Success
+    if (response.type === "error") {
+      throw new FileSystemError(response.message);
     }
 
-    throw new FileSystemError(`Unexpected response type: ${event.type}`);
+    throw new FileSystemError(`Unexpected response type: ${response.type}`);
   }
 
-  addStateListener(listener: StateListener): () => void {
-    this.stateListeners.add(listener);
-    // Immediately call with current state
-    listener(this.state);
-
-    return () => {
-      this.stateListeners.delete(listener);
+  async _closeFile(handle: string): Promise<void> {
+    const command: CloseFileCommand = {
+      type: "close_file",
+      handle,
     };
-  }
-
-  getState(): FileSystemState {
-    return this.state;
-  }
-
-  // Public connect method for manual connection attempts
-  async connectNow(): Promise<void> {
-    return this.connect();
-  }
-
-  async *openFile(path: string): AsyncGenerator<FileEvent> {
-    // Check if file is already open or opening
-    let openFile = this.openFiles.get(path);
-
-    if (!openFile) {
-      // Create the open file entry immediately to handle concurrency
-      let resolveOpening: () => void;
-      let rejectOpening: (error: Error) => void;
-
-      const openingPromise = new Promise<void>((resolve, reject) => {
-        resolveOpening = resolve;
-        rejectOpening = reject;
-      }).catch((error) => {
-        // Prevent unhandled rejection
-      });
-
-      openFile = {
-        path,
-        refCount: 1,
-        lastContent: "",
-        opening: openingPromise,
-        openers: new Set(),
-      };
-      this.openFiles.set(path, openFile);
-
-      // File not open yet - need to open it
-      // Connect if not already connected (just like writeFile and commit do)
-      if (this.state !== FileSystemState.CONNECTED) {
-        await this.connect();
-      }
-
-      // Send open_file command
-      const command: OpenFileCommand = {
-        type: "open_file",
-        path,
-      };
-
-      try {
-        const event = await this.sendCommand(command);
-
-        if (event.type !== "file_opened") {
-          const error = new FileSystemError(
-            `Unexpected response type: ${event.type}`,
-          );
-          rejectOpening!(error);
-          this.openFiles.delete(path);
-          throw error;
-        }
-
-        // File successfully opened
-        openFile.opening = null;
-        openFile.lastContent = event.content;
-
-        resolveOpening!();
-      } catch (error) {
-        rejectOpening!(error as Error);
-        this.openFiles.delete(path);
-        throw error;
-      }
-    } else if (openFile.opening) {
-      // File is currently being opened - wait for it to complete
-      openFile.refCount++;
-
-      await openFile.opening;
-    } else {
-      // File already open - increment ref count
-      openFile.refCount++;
-    }
-
-    // Create opener for this generator
-    const opener: FileOpener = {
-      eventQueue: [],
-      pendingPromise: null,
-      resolvePending: null,
-    };
-
-    openFile.openers.add(opener);
-
-    // Always use a synthetic file_opened event for simplicity. Note that
-    // this synthetic event might compress the initial file_opened event
-    // and subsequent file_updated events into a single event
-
-    opener.eventQueue.push({
-      type: "file_opened",
-      path,
-      content: openFile.lastContent,
-    });
 
     try {
-      yield* this.createFileGenerator(opener);
+      const response = await this.sendCommand(command);
+
+      if (response.type === "file_closed") {
+        this.openFiles.delete(handle);
+        return;
+      }
+
+      if (response.type === "error") {
+        throw new FileSystemError(response.message);
+      }
+
+      throw new FileSystemError(`Unexpected response type: ${response.type}`);
     } finally {
-      // Clean up when generator is closed
-      await this.closeFileOpener(path, opener);
+      // Always remove from tracking, even if close failed
+      this.openFiles.delete(handle);
     }
-  }
-
-  private async *createFileGenerator(
-    opener: FileOpener,
-  ): AsyncGenerator<FileEvent> {
-    while (true) {
-      // Get any events from the queue
-      const events = [...opener.eventQueue];
-      opener.eventQueue.length = 0; // Clear the queue
-
-      // Yield any events we have
-      for (const event of events) {
-        yield event;
-      }
-
-      // If we yielded events, continue to check for more immediately
-      if (events.length > 0) {
-        continue;
-      }
-
-      // No events available, wait for more
-      if (
-        this.state === FileSystemState.DISCONNECTED ||
-        this.state === FileSystemState.RECONNECT_WAIT
-      ) {
-        throw new FileSystemError("Connection lost");
-      }
-
-      // Set up promise for next batch of events
-      opener.pendingPromise = new Promise<void>((resolve) => {
-        opener.resolvePending = resolve;
-      });
-
-      await opener.pendingPromise;
-      opener.pendingPromise = null;
-    }
-  }
-
-  private async closeFileOpener(path: string, opener: FileOpener) {
-    const openFile = this.openFiles.get(path);
-    if (!openFile) {
-      return;
-    }
-
-    // Remove opener from set
-    openFile.openers.delete(opener);
-
-    // Decrement ref count
-    openFile.refCount--;
-
-    // If this was the last reference, close the file
-    if (openFile.refCount === 0) {
-      this.openFiles.delete(path);
-
-      // Send close_file command if connected
-      if (this.state === FileSystemState.CONNECTED) {
-        const command: CloseFileCommand = {
-          type: "close_file",
-          path,
-        };
-
-        this.sendCommand(command).catch((error) => {
-          if (!(error instanceof ConnectionClosedError)) {
-            console.warn("Failed to send close_file command:", error);
-          }
-        });
-      }
-    }
-  }
-
-  disconnect(): void {
-    // Clear any pending reconnection timeout
-    if (this.reconnectTimeoutId) {
-      clearTimeout(this.reconnectTimeoutId);
-      this.reconnectTimeoutId = null;
-    }
-
-    // Clear connection promise
-    this.connectionPromise = null;
-
-    // Reject all pending opener promises
-    for (const openFile of this.openFiles.values()) {
-      for (const opener of openFile.openers) {
-        if (opener.resolvePending) {
-          opener.resolvePending();
-        }
-      }
-    }
-
-    if (this.ws) {
-      this.ws.close();
-      this.ws = null;
-    }
-    this.setState(FileSystemState.DISCONNECTED);
   }
 }
 

@@ -18,12 +18,13 @@ the commands and responses being in order.)
 === Server events
 
 When a file is first opened, the server sends a `file_opened` event,
-with the content of the file.
+with the content of the file and the handle used for this file.
 
 ```json
 {
     "type": "file_opened",
     "path": "TASKS.md",
+    "handle": "1",
     "content": "Hello world"
 }
 ```
@@ -33,29 +34,29 @@ When a file is closed, the server sends a `file_closed` event.
 ```json
 {
     "type": "file_closed",
-    "path": "TASKS.md"
+    "handle": "1"
 }
 ```
 
 When the file is updated by another client (or the contents on disk are changed externally),
-the server sends a `file_updated` event.
+the server sends a `file_updated` event to all handles for that file except the one that caused the change.
 
 ```json
 {
     "type": "file_updated",
-    "path": "TASKS.md",
+    "handle": "1",
     "content": "Hello world"
 }
 ```
 
 When the file is updated by this client,
-the server sends a `file_written` event including the new content
-(which might differ from what was written if there is a merge with another client's changes)
+the server sends a `file_written` event to the handle that made the write, and `file_updated` events
+to all other handles for the same file. The content might differ from what was written if there is a merge with another client's changes.
 
 ```json
 {
     "type": "file_written",
-    "path": "TASKS.md",
+    "handle": "1",
     "content": "Hello world"
 }
 ```
@@ -81,8 +82,9 @@ If a command fails, the server sends an error event:
 
 === Client commands
 
-The `open_file` opens a file - the server will send the content of the file,
-and then send updates when the file is modified.
+The `open_file` opens a file with a specific handle - the server will send the content of the file,
+and then send updates when the file is modified. Each `open_file` command must have a unique handle
+per connection. Multiple handles can be opened for the same file.
 
 The path can start with @ to mean the committed version of a file,
 so @TASKS.md refers to the latest version committed to git.
@@ -90,37 +92,33 @@ so @TASKS.md refers to the latest version committed to git.
 ```json
 {
     "type": "open_file",
-    "path": "TASKS.md"
+    "path": "TASKS.md",
+    "handle": "1"
 }
 ```
 
-The `close_file` command closes a file - no further changes will be sent to the client
-for this file.
-Open and closes are refcounted for the connection so if you open a file twice,
-you need to close it twice.
-(The server will need to track the refcounts per connection, not globally,
-so that if the connection drops, stale refcounts are not left over.
-On reconnection all open files need to be reestablished.)
+The `close_file` command closes a specific file handle - no further changes will be sent to the client
+for this handle. Each handle can only be closed once.
 
 ```json
 {
     "type": "close_file",
-    "path": "TASKS.md"
+    "handle": "1"
 }
 ```
 
 The `write_file` command is sent when the user has edited a file,
-and the server should save the new content to disk.
+and the server should save the new content to disk. The handle must refer to an open file.
 The `last_content` field is the content of the file as last received from the server -
 this allows the server to detect if the file has been modified by another client,
 and intelligently merge the changes.
 
-The server will respond with a `file_written` event with the new content.
+The server will respond with a `file_written` event for the writing handle, and `file_updated` events for all other handles.
 
 ```json
 {
     "type": "write_file",
-    "path": "TASKS.md",
+    "handle": "1",
     "last_content": "Hello",
     "new_content": "Hello world"
 }
@@ -144,14 +142,15 @@ The client API is a wrapper around the websocket connection.
 type FileEvent = {
     type: "file_opened",
     path: string,
+    handle: string,
     content: string,
 } | {
     type: "file_updated",
-    path: string,
+    handle: string,
     content: string,
 } | {
     type: "file_written",
-    path: string,
+    handle: string,
     content: string,
 }
 
@@ -162,42 +161,64 @@ enum FileSystemState {
     CONNECTING,
     CONNECTED,
     DISCONNECTED,
+    RECONNECT_WAIT,
+}
+
+interface File {
+    // Get async generator for file events
+    getEvents(): AsyncGenerator<FileEvent>;
+
+    // Write to the file - client must provide the old content for proper merging
+    writeFile(oldContent: string, newContent: string): Promise<string>;
+
+    // Close the file handle (explicit cleanup) - fire and forget
+    close(): void;
+
+    // Get the path for this file
+    readonly path: string;
 }
 
 class FileSystem {
     constructor(url: string) {
     }
 
-    public async *openFile(path: string): AsyncGenerator<FileEvent> {
-    }
-
-    // Returns the new content of the file as merged by the server
-    public async writeFile(path: string, content: string): Promise<string> {
+    public openFile(path: string): File {
     }
 
     public async commit(message: string): Promise<void> {
     }
 
+    // Manual connection method - useful for "Connect Now" UI in RECONNECT_WAIT state
+    public async connectNow(): Promise<void> {
+    }
+
+    // Get current connection state
+    public getState(): FileSystemState {
+    }
+
     // Returns a function to remove the listener
     public addStateListener(listener: (state: FileSystemState) => void): () => void {
+    }
+
+    // Disconnect and stop automatic reconnection
+    public disconnect(): void {
     }
 }
 ```
 
-We close a file by breaking out of the generator returned by openFile.
+We close a file by calling the close() method on the File object.
 
 ```
 useEffect(() => {
     let isActive = true;
-
-    let fileEventsIterator;
+    let file;
 
     const watchFile = async () => {
         try {
             const fs = new FileSystem("ws://localhost:8080");
-            fileEventsIterator = fs.openFile(filename);
+            file = fs.openFile(filename);
 
-            for await (const event of fileEventsIterator) {
+            for await (const event of file.getEvents()) {
                 // Only update state if this effect is still the active one.
                 if (isActive) {
                     setMarkdown(event.content);
@@ -218,8 +239,8 @@ useEffect(() => {
     return () => {
         isActive = false;
 
-        if (fileEventsIterator) {
-            fileEventsIterator.return();
+        if (file) {
+            file.close();
         }
     };
 }, [filename]);
@@ -265,17 +286,20 @@ Connection and reconnection to the server is handled inside the FileSystem objec
  * The initial state of the FileSystem object is DISCONNECTED
  * When we attempt to connect, the state changes to CONNECTING and then if it succeeds, CONNECTED
  * A promise member in the fs object is used to make multiple simultaneous calls to connect() work properly
- * If a connection attempt fails, or the socket is disconnected, the state changes to RECONNECT_WAIT
+ * If a connection attempt fails, or the socket is disconnected:
+   - State changes to RECONNECT_WAIT if there are open files
+   - State changes to DISCONNECTED if there are no open files
  * In the DISCONNECTED or RECONNECT_WAIT state, the connection is attempted:
     - Automatically, if writeFile()/commit()/openFile() are called
-    - Manually, if fs.connect() is called [meant to be hooked up to a UI "connect now" for the RECONECT_WAIT STATE]
- * In the RECONNECT_WAIT state, the connection is also attemted to be reconnected with automatically with exponential back-off (starting 5s, doubling, limit 5m)
+    - Manually, if fs.connectNow() is called [meant to be hooked up to a UI "connect now" for the RECONNECT_WAIT state]
+ * In the RECONNECT_WAIT state, the connection is also attempted to be reconnected automatically with exponential back-off (starting 5s, doubling, limit 5m)
 
 The following additional behaviors exist:
 
  * If the connection inside writeFile/commit/openFile fails, the operation fails with an exception
- * openFile on an already open file always succeeds - a synthetic file_opened event is generated locally.
- * On reconnection, all file_open commands are sent for all open files, and the file_opened events are locally transformed into file_updated events, if the received content differs from the last received content
+ * getEvents() can only be called once per file - subsequent calls throw an error
+ * close() is fire-and-forget - it doesn't wait for server confirmation
+ * On reconnection, file_open commands are sent only for files that have been successfully opened before (not files still in the opening process), and subsequent file_opened events are locally transformed into file_updated events if the received content differs from the last received content
 
 The FileSystem object also has the ability to add a listener for the state (disconnected, connecting, reconnect_wait, connected), that is used to indicate in the UI that the connection has been lost.
 
@@ -380,45 +404,6 @@ To read the committed versions of files, we read and track changes to .git/HEAD 
 When the ref changes, we read open files from that revision using `git cat-file blob <rev>:<path>`
 and notify if necessary.
 
-== PROTOCOL AND CLIENT API REVISION
-
-The current design causes a lot of complexity on the client side around managing
-opening the same file multiple times, especially on reconnection. If we treat
-multiple opens of the same file as independent, things get a lot simpler.
-
-To this end:
-
-Add a "handle" argument (an arbitrary opaque string) to `file_open`/`file_close`.
-This is sent back in the `file_opened` event, and also in each `file_updated` call.
-The reference counting in the protocol is removed - the handle must be unique for
-each file_open call, and you can only call `file_close` once per each handle.
-
-The "handle" argument is also included with `write_file` - so `write_file` can now only
-be called for an open file - and with the `file_written` response. The handle passed to
-`write_file` only the `file_written` response, but if the file is separately open with
-a different handle, *that* handle will see `file_updated`.
-
-THe client API is changed to match in the following way:
-
- * openFile now returns a File object
- * The File object now has `async *getEvents(): AsyncGenerator<FileEvent>'
- * The File object also has `async writeFile(newContent: string): Promise<string>`
-
-The FileSystem Python API should not need many changes - it will keep the current
-reference counting. One change that will be helpful - replace the exclude_watcher
-parameter to write_file with:
-
-  source: tuple[FileSystemWatcher, str] | None = None
-
-and `_notify_watchers` does something like:
-
-```python
-        for watcher in self.watchers:
-            if source is not None and watcher = source[0]:
-                watcher.on_file_change(filename, content, source[1])
-            else:
-                watcher.on_file_change(filename, content, None)
-```
 
 == Implementation Plan
 
@@ -499,13 +484,12 @@ and `_notify_watchers` does something like:
 - File reestablishment on reconnect with content change detection
 - Public connectNow() method and comprehensive test coverage (8 tests)
 
-**Phase 7: Protocol and Client Revision** 🚧 TODO
-- Update tests/test_file_system.py and tests/test_file_websocket.py
-- Update the Python server implementation
-- Update ui/src/index.test.ts
-- Update the client implemetation
-- Incorporate the changes from "PROTOCOL AND CLIENT API REVISION" section into the
-  body of FILESYSTEM_DESIGN.md and delete the revsion section.
+**Phase 7: Protocol and Client Revision** ✅ COMPLETED
+- ✅ Updated tests/test_files_websocket.py for handle-based protocol
+- ✅ Updated the Python server implementation with handle support
+- ✅ Created new TypeScript client tests for File object API
+- ✅ Implemented new TypeScript client with File object interface
+- ✅ Incorporated protocol changes into main FILESYSTEM_DESIGN.md documentation
 
 **Phase 8: React Integration** 🚧 TODO
 - Integrate TypeScript FileSystem with React application

@@ -15,7 +15,7 @@ import tempfile
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Callable, AsyncIterator
+from typing import Dict, List, Optional, Callable, AsyncIterator, Tuple
 
 from watchfiles import awatch, Change
 from diff_match_patch import diff_match_patch
@@ -36,8 +36,14 @@ class FileSystemWatcher(abc.ABC):
     """Abstract base class for objects that watch file system changes."""
 
     @abc.abstractmethod
-    def on_file_change(self, filename: str, content: str) -> None:
-        """Called when a file changes."""
+    def on_file_change(self, filename: str, content: str, source_handle: Optional[str] = None) -> None:
+        """Called when a file changes.
+
+        Args:
+            filename: The path of the file that changed
+            content: The new content of the file
+            source_handle: Handle that caused the change (None for external changes)
+        """
         pass
 
 
@@ -205,7 +211,7 @@ class FileSystem:
         filename: str,
         last_content: str,
         content: str,
-        exclude_watcher: Optional[FileSystemWatcher] = None,
+        source: Optional[Tuple[FileSystemWatcher, str]] = None,
     ) -> str:
         """
         Write content to a file with conflict resolution.
@@ -214,7 +220,7 @@ class FileSystem:
             filename: Path to the file relative to repository root
             last_content: The content as last known by the client
             content: The new content to write
-            exclude_watcher: Watcher to exclude from notifications
+            source: (watcher, handle) tuple identifying the source of the write
 
         Returns:
             The actual content written (may differ due to merging)
@@ -258,7 +264,7 @@ class FileSystem:
                 self.close_file(filename)
 
         # Notify watchers after closing to ensure file state is consistent
-        self._notify_watchers(filename, new_content, exclude_watcher)
+        self._notify_watchers(filename, new_content, source)
 
         return new_content
 
@@ -294,7 +300,7 @@ class FileSystem:
 
         # Notify watchers after closing to ensure file state is consistent
         if opened:
-            self._notify_watchers(filename, new_content)
+            self._notify_watchers(filename, new_content, None)
 
     def _write_file_atomic(self, file_path: Path, content: str) -> float:
         """
@@ -398,12 +404,14 @@ class FileSystem:
         self,
         filename: str,
         content: str,
-        exclude_watcher: Optional[FileSystemWatcher] = None,
+        source: Optional[Tuple[FileSystemWatcher, str]] = None,
     ) -> None:
         """Notify all watchers of a file change."""
         for watcher in self.watchers:
-            if watcher != exclude_watcher:
-                watcher.on_file_change(filename, content)
+            if source is not None and watcher == source[0]:
+                watcher.on_file_change(filename, content, source[1])
+            else:
+                watcher.on_file_change(filename, content, None)
 
     @asynccontextmanager
     async def watch_files(self) -> AsyncIterator[None]:
@@ -505,7 +513,7 @@ class FileSystem:
             del self.files[filename]
 
             # Notify watchers that the file was deleted (with empty content)
-            self._notify_watchers(filename, "")
+            self._notify_watchers(filename, "", None)
 
     async def _handle_file_modification(self, filename: str, file_path: Path) -> None:
         """
@@ -538,7 +546,7 @@ class FileSystem:
                 self.files[filename].mtime = current_mtime
 
                 # Notify watchers of the change
-                self._notify_watchers(filename, new_content)
+                self._notify_watchers(filename, new_content, None)
 
         except (OSError, UnicodeDecodeError):
             # Error reading file, might be temporarily inaccessible
@@ -720,7 +728,7 @@ class FileSystem:
                     self.files[filename].content = new_content
 
                     # Notify watchers
-                    self._notify_watchers(filename, new_content)
+                    self._notify_watchers(filename, new_content, None)
 
             except Exception:
                 logger.exception("Error updating committed file %s", filename)

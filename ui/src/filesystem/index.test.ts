@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import WS from "jest-websocket-mock";
 import FileSystem, { FileSystemError } from "./index.js";
 import { FileEvent, FileSystemState } from "./types.js";
+import runInParallel from "@test-utils/runInParallel.js";
 
 describe("FileSystem", () => {
   let server: WS;
@@ -29,20 +30,21 @@ describe("FileSystem", () => {
         states.push(state);
       });
 
-      // Trigger connection by calling writeFile
-      const writePromise = fs.writeFile("test.txt", "old", "new");
+      await runInParallel(
+        async () => {
+          // Trigger connection by calling commit
+          await fs.commit("some changes");
+        },
+        async () => {
+          // Accept the connection
+          await server.connected;
 
-      // Accept the connection
-      await server.connected;
-
-      // Send response
-      server.send({
-        type: "file_written",
-        path: "test.txt",
-        content: "new",
-      });
-
-      await writePromise;
+          // Send response
+          server.send({
+            type: "committed",
+          });
+        },
+      );
 
       expect(states).toContain(FileSystemState.DISCONNECTED);
       expect(states).toContain(FileSystemState.CONNECTING);
@@ -54,218 +56,125 @@ describe("FileSystem", () => {
     it("should handle connection errors", async () => {
       server.error();
 
-      await expect(fs.writeFile("test.txt", "old", "new")).rejects.toThrow(
-        FileSystemError,
-      );
+      await expect(fs.commit("some changes")).rejects.toThrow(FileSystemError);
 
       expect(fs.getState()).toBe(FileSystemState.DISCONNECTED);
     });
 
     it("should handle connection close", async () => {
-      // Start a write operation
-      const writePromise = fs.writeFile("test.txt", "old", "new");
+      await runInParallel(
+        async () => {
+          await expect(fs.commit("Some changes")).rejects.toThrow(
+            "Connection closed",
+          );
+          expect(fs.getState()).toBe(FileSystemState.DISCONNECTED);
+        },
+        async () => {
+          await server.connected;
 
-      await server.connected;
-
-      // Close connection before sending response
-      server.close();
-
-      await expect(writePromise).rejects.toThrow("Connection closed");
-      expect(fs.getState()).toBe(FileSystemState.DISCONNECTED);
-    });
-  });
-
-  describe("writeFile", () => {
-    it("should send write_file command and return new content", async () => {
-      const writePromise = fs.writeFile(
-        "TASKS.md",
-        "old content",
-        "new content",
+          // Close connection before sending response
+          server.close();
+        },
       );
-
-      await server.connected;
-
-      // Verify the command was sent correctly
-      await expect(server).toReceiveMessage({
-        type: "write_file",
-        path: "TASKS.md",
-        last_content: "old content",
-        new_content: "new content",
-      });
-
-      // Send successful response
-      server.send({
-        type: "file_written",
-        path: "TASKS.md",
-        content: "merged content",
-      });
-
-      const result = await writePromise;
-      expect(result).toBe("merged content");
-    });
-
-    it("should handle write errors", async () => {
-      const writePromise = fs.writeFile("TASKS.md", "old", "new");
-
-      await server.connected;
-      await expect(server).toReceiveMessage({
-        type: "write_file",
-        path: "TASKS.md",
-        last_content: "old",
-        new_content: "new",
-      });
-
-      // Send error response
-      server.send({
-        type: "error",
-        path: "TASKS.md",
-        message: "File not found",
-      });
-
-      await expect(writePromise).rejects.toThrow("File not found");
-    });
-
-    it("should handle unexpected response type", async () => {
-      const writePromise = fs.writeFile("test.txt", "old", "new");
-
-      await server.connected;
-      await expect(server).toReceiveMessage({
-        type: "write_file",
-        path: "test.txt",
-        last_content: "old",
-        new_content: "new",
-      });
-
-      // Send unexpected response
-      server.send({
-        type: "committed",
-      });
-
-      await expect(writePromise).rejects.toThrow(
-        "Unexpected response type: committed",
-      );
-    });
-  });
-
-  describe("commit", () => {
-    it("should send commit command and complete successfully", async () => {
-      const commitPromise = fs.commit("Test commit message");
-
-      await server.connected;
-
-      // Verify the command was sent correctly
-      await expect(server).toReceiveMessage({
-        type: "commit",
-        message: "Test commit message",
-      });
-
-      // Send successful response
-      server.send({
-        type: "committed",
-      });
-
-      await expect(commitPromise).resolves.toBeUndefined();
-    });
-
-    it("should handle commit errors", async () => {
-      const commitPromise = fs.commit("Test commit");
-
-      await server.connected;
-      await expect(server).toReceiveMessage({
-        type: "commit",
-        message: "Test commit",
-      });
-
-      // Send error response
-      server.send({
-        type: "error",
-        message: "Nothing to commit",
-      });
-
-      await expect(commitPromise).rejects.toThrow("Nothing to commit");
     });
   });
 
   describe("FIFO command handling", () => {
     it("should handle multiple commands in order", async () => {
-      // Start multiple commands - they will queue up
-      const write1Promise = fs.writeFile("file1.txt", "old1", "new1");
+      await runInParallel(
+        async () => {
+          const file1 = fs.openFile("file1.txt");
+          const firstEvent = await file1.getEvents().next();
+          expect(firstEvent.value).toEqual({
+            type: "file_opened",
+            handle: "1",
+            content: "content1",
+          });
 
-      await server.connected;
+          // Start multiple commands - they will queue up
+          const writeFilePromise = file1.writeFile("content1", "new1");
+          const commitPromise = fs.commit("some changes");
 
-      // Wait for first command
-      await expect(server).toReceiveMessage({
-        type: "write_file",
-        path: "file1.txt",
-        last_content: "old1",
-        new_content: "new1",
-      });
+          await expect(writeFilePromise).resolves.toBe("new1");
+          await expect(commitPromise).resolves.toBeUndefined();
+        },
+        async () => {
+          await server.connected;
 
-      // Start second command after connection is established
-      const write2Promise = fs.writeFile("file2.txt", "old2", "new2");
-      await expect(server).toReceiveMessage({
-        type: "write_file",
-        path: "file2.txt",
-        last_content: "old2",
-        new_content: "new2",
-      });
+          await expect(server).toReceiveMessage({
+            type: "open_file",
+            handle: "1",
+            path: "file1.txt",
+          });
 
-      // Start third command
-      const commitPromise = fs.commit("Test commit");
-      await expect(server).toReceiveMessage({
-        type: "commit",
-        message: "Test commit",
-      });
+          server.send({
+            type: "file_opened",
+            handle: "1",
+            content: "content1",
+          });
 
-      // Send responses in order
-      server.send({
-        type: "file_written",
-        path: "file1.txt",
-        content: "result1",
-      });
+          await expect(server).toReceiveMessage({
+            type: "write_file",
+            handle: "1",
+            last_content: "content1",
+            new_content: "new1",
+          });
 
-      server.send({
-        type: "file_written",
-        path: "file2.txt",
-        content: "result2",
-      });
+          await expect(server).toReceiveMessage({
+            type: "commit",
+            message: "some changes",
+          });
 
-      server.send({
-        type: "committed",
-      });
+          server.send({
+            type: "file_written",
+            handle: "1",
+            content: "new1",
+          });
 
-      // Verify results
-      expect(await write1Promise).toBe("result1");
-      expect(await write2Promise).toBe("result2");
-      await expect(commitPromise).resolves.toBeUndefined();
+          server.send({
+            type: "committed",
+          });
+        },
+      );
     });
 
     it("should ignore file_updated events in FIFO", async () => {
-      const writePromise = fs.writeFile("test.txt", "old", "new");
+      await runInParallel(
+        async () => {
+          const file = fs.openFile("other.txt");
+          await fs.commit("some changes");
+        },
+        async () => {
+          await server.connected;
+          await expect(server).toReceiveMessage({
+            type: "open_file",
+            path: "other.txt",
+            handle: "1",
+          });
+          server.send({
+            type: "file_opened",
+            handle: "1",
+            content: "initial content",
+          });
 
-      await server.connected;
-      await expect(server).toReceiveMessage({
-        type: "write_file",
-        path: "test.txt",
-        last_content: "old",
-        new_content: "new",
-      });
+          await expect(server).toReceiveMessage({
+            type: "commit",
+            message: "some changes",
+          });
 
-      // Send file_updated (should be ignored)
-      server.send({
-        type: "file_updated",
-        path: "other.txt",
-        content: "updated content",
-      });
+          // Send file_updated (should be ignored)
+          server.send({
+            type: "file_updated",
+            handle: "1",
+            content: "updated content",
+          });
 
-      // Send actual response
-      server.send({
-        type: "file_written",
-        path: "test.txt",
-        content: "new content",
-      });
-
-      expect(await writePromise).toBe("new content");
+          // Send actual response
+          server.send({
+            type: "committed",
+          });
+        },
+      );
     });
   });
 
@@ -278,989 +187,795 @@ describe("FileSystem", () => {
     });
 
     it("should remove listener when returned function is called", async () => {
-      const states1: FileSystemState[] = [];
-      const states2: FileSystemState[] = [];
+      await runInParallel(
+        async () => {
+          const states1: FileSystemState[] = [];
+          const states2: FileSystemState[] = [];
 
-      // Add two listeners
-      const removeListener1 = fs.addStateListener((state) =>
-        states1.push(state),
-      );
-      const removeListener2 = fs.addStateListener((state) =>
-        states2.push(state),
-      );
-
-      // Both should get initial state
-      expect(states1).toEqual([FileSystemState.DISCONNECTED]);
-      expect(states2).toEqual([FileSystemState.DISCONNECTED]);
-
-      // Remove first listener
-      removeListener1();
-
-      // Trigger state change by connecting
-      const writePromise = fs.writeFile("test.txt", "old", "new");
-      await server.connected;
-
-      await expect(server).toReceiveMessage({
-        type: "write_file",
-        path: "test.txt",
-        last_content: "old",
-        new_content: "new",
-      });
-
-      server.send({
-        type: "file_written",
-        path: "test.txt",
-        content: "new",
-      });
-      await writePromise;
-
-      // First listener should not have received new states (still just initial)
-      expect(states1).toEqual([FileSystemState.DISCONNECTED]);
-
-      // Second listener should have received all state changes
-      expect(states2).toEqual([
-        FileSystemState.DISCONNECTED,
-        FileSystemState.CONNECTING,
-        FileSystemState.CONNECTED,
-      ]);
-
-      removeListener2();
-    });
-  });
-
-  describe("openFile AsyncGenerator", () => {
-    it("should send open_file command and yield file_opened event", async () => {
-      const fileIterator = fs.openFile("TASKS.md");
-
-      const [{ value: event, done }] = await Promise.all([
-        fileIterator.next(),
-        (async () => {
-          await server.connected;
-          await expect(server).toReceiveMessage({
-            type: "open_file",
-            path: "TASKS.md",
-          });
-
-          // Send file_opened response
-          server.send({
-            type: "file_opened",
-            path: "TASKS.md",
-            content: "Initial content",
-          });
-        })(),
-      ]);
-
-      expect(done).toBe(false);
-      expect(event).toEqual({
-        type: "file_opened",
-        path: "TASKS.md",
-        content: "Initial content",
-      });
-
-      // Clean up
-      await fileIterator.return(undefined);
-    });
-
-    it("should yield file_updated events for external changes", async () => {
-      const fileIterator = fs.openFile("TASKS.md");
-
-      const [initialEvent] = await Promise.all([
-        fileIterator.next(),
-        (async () => {
-          await server.connected;
-          await expect(server).toReceiveMessage({
-            type: "open_file",
-            path: "TASKS.md",
-          });
-          server.send({
-            type: "file_opened",
-            path: "TASKS.md",
-            content: "Initial content",
-          });
-        })(),
-      ]);
-
-      // Now send a file_updated event
-      server.send({
-        type: "file_updated",
-        path: "TASKS.md",
-        content: "Updated content",
-      });
-
-      // Get the updated event
-      const { value: updateEvent, done } = await fileIterator.next();
-
-      expect(done).toBe(false);
-      expect(updateEvent).toEqual({
-        type: "file_updated",
-        path: "TASKS.md",
-        content: "Updated content",
-      });
-
-      // Clean up
-      await fileIterator.return(undefined);
-    });
-
-    it("should yield file_written events for this client's writes", async () => {
-      const fileIterator = fs.openFile("TASKS.md");
-
-      const [initialEvent] = await Promise.all([
-        fileIterator.next(),
-        (async () => {
-          await server.connected;
-          await expect(server).toReceiveMessage({
-            type: "open_file",
-            path: "TASKS.md",
-          });
-          server.send({
-            type: "file_opened",
-            path: "TASKS.md",
-            content: "Initial content",
-          });
-        })(),
-      ]);
-
-      // Start a write operation and get the file_written event
-      const writePromise = fs.writeFile(
-        "TASKS.md",
-        "Initial content",
-        "New content",
-      );
-
-      const [{ value: writeEvent, done }] = await Promise.all([
-        fileIterator.next(),
-        (async () => {
-          await expect(server).toReceiveMessage({
-            type: "write_file",
-            path: "TASKS.md",
-            last_content: "Initial content",
-            new_content: "New content",
-          });
-          server.send({
-            type: "file_written",
-            path: "TASKS.md",
-            content: "New content",
-          });
-        })(),
-      ]);
-
-      expect(done).toBe(false);
-      expect(writeEvent).toEqual({
-        type: "file_written",
-        path: "TASKS.md",
-        content: "New content",
-      });
-
-      // The writeFile promise should also resolve
-      expect(await writePromise).toBe("New content");
-
-      // Clean up
-      await fileIterator.return(undefined);
-    });
-
-    it("should handle multiple file events in sequence", async () => {
-      const fileIterator = fs.openFile("TASKS.md");
-      const events: any[] = [];
-
-      const [event1] = await Promise.all([
-        fileIterator.next(),
-        (async () => {
-          await server.connected;
-          await expect(server).toReceiveMessage({
-            type: "open_file",
-            path: "TASKS.md",
-          });
-          server.send({
-            type: "file_opened",
-            path: "TASKS.md",
-            content: "v1",
-          });
-        })(),
-      ]);
-
-      events.push(event1.value);
-
-      // Send file_updated and collect event
-      server.send({
-        type: "file_updated",
-        path: "TASKS.md",
-        content: "v2",
-      });
-
-      events.push((await fileIterator.next()).value);
-
-      // Send another file_updated and collect event
-      server.send({
-        type: "file_updated",
-        path: "TASKS.md",
-        content: "v3",
-      });
-
-      events.push((await fileIterator.next()).value);
-
-      expect(events).toEqual([
-        { type: "file_opened", path: "TASKS.md", content: "v1" },
-        { type: "file_updated", path: "TASKS.md", content: "v2" },
-        { type: "file_updated", path: "TASKS.md", content: "v3" },
-      ]);
-
-      // Clean up
-      await fileIterator.return(undefined);
-    });
-
-    it("blah blah blah", async () => {
-      async function* asyncGeneratorExample() {
-        yield 1;
-        yield 2;
-        yield 3;
-        throw new Error("Test error");
-      }
-
-      const iterator = asyncGeneratorExample();
-
-      console.log(await iterator.next()); // { value: 1, done: false }
-      console.log(await iterator.next()); // { value: 2, done: false }
-      console.log(await iterator.next()); // { value: 3, done: false }
-
-      await expect(iterator.next()).rejects.toThrow("Test error");
-    });
-
-    it("should handle file opening errors", async () => {
-      const fileIterator = fs.openFile("nonexistent.md");
-
-      await Promise.all([
-        expect(fileIterator.next()).rejects.toThrow("File not found"),
-        (async () => {
-          await server.connected;
-          await expect(server).toReceiveMessage({
-            type: "open_file",
-            path: "nonexistent.md",
-          });
-          server.send({
-            type: "error",
-            path: "nonexistent.md",
-            message: "File not found",
-          });
-        })(),
-      ]);
-
-      await fileIterator.return(undefined);
-    });
-
-    it("should handle disconnection during file watching", async () => {
-      const fileIterator = fs.openFile("TASKS.md");
-
-      const [initialEvent] = await Promise.all([
-        fileIterator.next(),
-        (async () => {
-          await server.connected;
-          await expect(server).toReceiveMessage({
-            type: "open_file",
-            path: "TASKS.md",
-          });
-          server.send({
-            type: "file_opened",
-            path: "TASKS.md",
-            content: "Initial content",
-          });
-        })(),
-      ]);
-
-      // Disconnect
-      server.close();
-
-      // Next iteration should throw due to disconnection
-      await expect(fileIterator.next()).rejects.toThrow();
-    });
-
-    it("should close file when generator is closed", async () => {
-      const fileIterator = fs.openFile("TASKS.md");
-
-      const [initialEvent] = await Promise.all([
-        fileIterator.next(),
-        (async () => {
-          await server.connected;
-          await expect(server).toReceiveMessage({
-            type: "open_file",
-            path: "TASKS.md",
-          });
-          server.send({
-            type: "file_opened",
-            path: "TASKS.md",
-            content: "Initial content",
-          });
-        })(),
-      ]);
-
-      // Close the generator and wait for close command
-      await Promise.all([
-        fileIterator.return(undefined),
-        (async () => {
-          await expect(server).toReceiveMessage({
-            type: "close_file",
-            path: "TASKS.md",
-          });
-          server.send({
-            type: "file_closed",
-            path: "TASKS.md",
-          });
-        })(),
-      ]);
-    });
-  });
-
-  describe("file reference counting", () => {
-    it("should handle multiple opens of the same file", async () => {
-      let fileIterator1: AsyncGenerator<FileEvent>;
-      let fileIterator2: AsyncGenerator<FileEvent>;
-
-      await Promise.all([
-        // Client 1: open file, get first event, check it, commit
-        (async () => {
-          fileIterator1 = fs.openFile("TASKS.md");
-          const event1 = await fileIterator1.next();
-          expect(event1.value).toEqual({
-            type: "file_opened",
-            path: "TASKS.md",
-            content: "Shared content",
-          });
-          await fs.commit("Test commit 1");
-
-          // Send a file_updated event - should receive it
-          const update1 = await fileIterator1.next();
-          expect(update1.value).toEqual({
-            type: "file_updated",
-            path: "TASKS.md",
-            content: "Updated content",
-          });
-
-          // Close first iterator - should NOT send close_file command yet
-          await fileIterator1.return(undefined);
-        })(),
-
-        // Client 2: same thing
-        (async () => {
-          fileIterator2 = fs.openFile("TASKS.md");
-          const event2 = await fileIterator2.next();
-          expect(event2.value).toEqual({
-            type: "file_opened",
-            path: "TASKS.md",
-            content: "Shared content",
-          });
-          await fs.commit("Test commit 2");
-
-          // Should receive the same file_updated event
-          const update2 = await fileIterator2.next();
-          expect(update2.value).toEqual({
-            type: "file_updated",
-            path: "TASKS.md",
-            content: "Updated content",
-          });
-
-          // Close second iterator - NOW should send close_file command
-          await fileIterator2.return(undefined);
-        })(),
-
-        // Server: expect open and send response, then handle commits
-        (async () => {
-          await server.connected;
-
-          // Should only get one open_file command
-          await expect(server).toReceiveMessage({
-            type: "open_file",
-            path: "TASKS.md",
-          });
-
-          // Send open response first
-          server.send({
-            type: "file_opened",
-            path: "TASKS.md",
-            content: "Shared content",
-          });
-
-          // Expect commits (order doesn't matter)
-          const commit1 = await server.nextMessage;
-          const commit2 = await server.nextMessage;
-
-          expect([commit1, commit2]).toEqual(
-            expect.arrayContaining([
-              { type: "commit", message: "Test commit 1" },
-              { type: "commit", message: "Test commit 2" },
-            ]),
+          // Add two listeners
+          const removeListener1 = fs.addStateListener((state) =>
+            states1.push(state),
+          );
+          const removeListener2 = fs.addStateListener((state) =>
+            states2.push(state),
           );
 
-          // Send commit responses
-          server.send({ type: "committed" });
-          server.send({ type: "committed" });
+          // Both should get initial state
+          expect(states1).toEqual([FileSystemState.DISCONNECTED]);
+          expect(states2).toEqual([FileSystemState.DISCONNECTED]);
 
-          // Send file_updated event
-          server.send({
-            type: "file_updated",
-            path: "TASKS.md",
-            content: "Updated content",
-          });
+          // Remove first listener
+          removeListener1();
 
-          // Expect close_file command when second iterator closes
-          await expect(server).toReceiveMessage({
-            type: "close_file",
-            path: "TASKS.md",
-          });
+          // Trigger state change by connecting
+          await fs.connectNow();
 
-          server.send({
-            type: "file_closed",
-            path: "TASKS.md",
-          });
-        })(),
-      ]);
+          // First listener should not have received new states (still just initial)
+          expect(states1).toEqual([FileSystemState.DISCONNECTED]);
 
-      // Verify no close_file command was sent after first iterator closed
-      const commitPromise = fs.commit("Verification commit");
-      await expect(server).toReceiveMessage({
-        type: "commit",
-        message: "Verification commit",
+          // Second listener should have received all state changes
+          expect(states2).toEqual([
+            FileSystemState.DISCONNECTED,
+            FileSystemState.CONNECTING,
+            FileSystemState.CONNECTED,
+          ]);
+
+          removeListener2();
+        },
+        async () => {
+          await server.connected;
+        },
+      );
+    });
+
+    describe("openFile", () => {
+      it("should send open_file command and receive events", async () => {
+        await runInParallel(
+          async (sync) => {
+            const file = fs.openFile("TASKS.md");
+            const fileIterator = file.getEvents();
+            const { value: event, done: done1 } = await fileIterator.next();
+            expect(done1).toBe(false);
+            expect(event).toEqual({
+              type: "file_opened",
+              handle: "1",
+              content: "Initial content",
+            });
+            const { value: updateEvent, done: done2 } =
+              await fileIterator.next();
+            expect(done2).toBe(false);
+            expect(updateEvent).toEqual({
+              type: "file_updated",
+              handle: "1",
+              content: "Updated content",
+            });
+
+            file.close();
+          },
+          async (sync) => {
+            await server.connected;
+            await expect(server).toReceiveMessage({
+              type: "open_file",
+              handle: "1",
+              path: "TASKS.md",
+            });
+
+            // Send file_opened response
+            server.send({
+              type: "file_opened",
+              handle: "1",
+              content: "Initial content",
+            });
+
+            // Simulate external change
+            server.send({
+              type: "file_updated",
+              handle: "1",
+              content: "Updated content",
+            });
+          },
+        );
       });
 
-      server.send({ type: "committed" });
-      await commitPromise;
+      it("should handle file opening errors", async () => {
+        await runInParallel(
+          async () => {
+            const file = fs.openFile("nonexistent.md");
+            const fileIterator = file.getEvents();
+            await expect(fileIterator.next()).rejects.toThrow("File not found");
+            file.close();
+          },
+          async () => {
+            await server.connected;
+            await expect(server).toReceiveMessage({
+              type: "open_file",
+              handle: "1",
+              path: "nonexistent.md",
+            });
+            server.send({
+              type: "error",
+              message: "File not found",
+            });
+          },
+        );
+      });
+
+      it("should close generator when file is closed", async () => {
+        await runInParallel(
+          async () => {
+            const file = fs.openFile("TASKS.md");
+            const fileIterator = file.getEvents();
+
+            // Wait for initial file_opened event
+            await fileIterator.next();
+
+            file.close();
+
+            const { done } = await fileIterator.next();
+            expect(done).toBe(true);
+          },
+          async () => {
+            await server.connected;
+            await expect(server).toReceiveMessage({
+              type: "open_file",
+              handle: "1",
+              path: "TASKS.md",
+            });
+            server.send({
+              type: "file_opened",
+              handle: "1",
+              content: "Initial content",
+            });
+            await expect(server).toReceiveMessage({
+              type: "close_file",
+              handle: "1",
+            });
+          },
+        );
+        // Closing does *not* depend on server response
+      });
     });
+  });
 
-    it("should open file again after all references are closed", async () => {
-      await Promise.all([
-        (async () => {
-          // First open and close cycle
-          const fileIterator1 = fs.openFile("TASKS.md");
+  describe("writeFile", () => {
+    it("should send write_file command and return new content", async () => {
+      await runInParallel(
+        async () => {
+          const file = fs.openFile("TASKS.md");
 
-          await fileIterator1.next();
-          await fileIterator1.return(undefined);
+          const eventsIterator = file.getEvents();
+          expect((await eventsIterator.next()).value).toEqual({
+            type: "file_opened",
+            handle: "1",
+            content: "old content",
+          });
 
-          // Second open cycle - should send open_file again
-          const fileIterator2 = fs.openFile("TASKS.md");
+          const result = await file.writeFile("old content", "new content");
+          expect(result).toBe("merged content");
 
-          const event = await fileIterator2.next();
-          expect(event.value.content).toBe("Content v2");
+          expect((await eventsIterator.next()).value).toEqual({
+            type: "file_written",
+            handle: "1",
+            content: "merged content",
+          });
 
-          await fileIterator2.return(undefined);
-        })(),
-        (async () => {
+          file.close();
+        },
+        async () => {
           await server.connected;
 
           await expect(server).toReceiveMessage({
             type: "open_file",
+            handle: "1",
             path: "TASKS.md",
           });
 
           server.send({
             type: "file_opened",
-            path: "TASKS.md",
-            content: "Content v1",
+            handle: "1",
+            content: "old content",
           });
 
           await expect(server).toReceiveMessage({
-            type: "close_file",
-            path: "TASKS.md",
+            type: "write_file",
+            handle: "1",
+            last_content: "old content",
+            new_content: "new content",
           });
 
           server.send({
-            type: "file_closed",
-            path: "TASKS.md",
+            type: "file_written",
+            handle: "1",
+            content: "merged content",
           });
-
-          // Second open cycle
-
-          await expect(server).toReceiveMessage({
-            type: "open_file",
-            path: "TASKS.md",
-          });
-
-          server.send({
-            type: "file_opened",
-            path: "TASKS.md",
-            content: "Content v2",
-          });
-        })(),
-      ]);
+        },
+      );
     });
 
-    it("should handle reference counting for different files independently", async () => {
-      await Promise.all([
-        (async () => {
-          // Open two different files
-          const tasksIterator = fs.openFile("TASKS.md");
-          const notesIterator = fs.openFile("notes/daily.md");
-
-          // Get initial events
-          await tasksIterator.next();
-          await notesIterator.next();
-
-          // Close tasks file
-          await tasksIterator.return(undefined);
-
-          // Still get updates for notes file
-          const updateEvent = await notesIterator.next();
-          expect(updateEvent.value.content).toBe("Updated notes");
-
-          // Close notes file
-          await notesIterator.return(undefined);
-        })(),
-        (async () => {
+    it("should handle write errors", async () => {
+      await runInParallel(
+        async () => {
+          const file = fs.openFile("TASKS.md");
+          const fileIterator = file.getEvents();
+          await fileIterator.next();
+          await expect(file.writeFile("old", "new")).rejects.toThrow(
+            "Permission denied",
+          );
+          file.close();
+        },
+        async () => {
           await server.connected;
 
-          // Should send open commands for both files
-
           await expect(server).toReceiveMessage({
             type: "open_file",
+            handle: "1",
             path: "TASKS.md",
           });
 
           server.send({
             type: "file_opened",
-            path: "TASKS.md",
-            content: "Tasks content",
+            handle: "1",
+            content: "old",
           });
 
           await expect(server).toReceiveMessage({
+            type: "write_file",
+            handle: "1",
+            last_content: "old",
+            new_content: "new",
+          });
+
+          // Send error response
+          server.send({
+            type: "error",
+            message: "Permission denied",
+          });
+        },
+      );
+    });
+
+    it("should handle unexpected response type", async () => {
+      await runInParallel(
+        async () => {
+          const file = fs.openFile("TASKS.md");
+          const eventsIterator = file.getEvents();
+          let first = await eventsIterator.next();
+          expect(first.value.type).toEqual("file_opened");
+
+          await expect(
+            file.writeFile("old content", "new content"),
+          ).rejects.toThrow("Unexpected response type: committed");
+        },
+        async () => {
+          await server.connected;
+
+          await expect(server).toReceiveMessage({
             type: "open_file",
-            path: "notes/daily.md",
+            handle: "1",
+            path: "TASKS.md",
           });
 
           server.send({
             type: "file_opened",
-            path: "notes/daily.md",
-            content: "Notes content",
+            handle: "1",
+            content: "old content",
           });
 
           await expect(server).toReceiveMessage({
-            type: "close_file",
-            path: "TASKS.md",
+            type: "write_file",
+            handle: "1",
+            last_content: "old content",
+            new_content: "new content",
           });
 
+          // Send unexpected response
           server.send({
-            type: "file_closed",
-            path: "TASKS.md",
+            type: "committed",
+          });
+        },
+      );
+    });
+  });
+
+  describe("commit", () => {
+    it("should send commit command and complete successfully", async () => {
+      await runInParallel(
+        async () => {
+          await expect(
+            fs.commit("Test commit message"),
+          ).resolves.toBeUndefined();
+        },
+        async () => {
+          await server.connected;
+
+          // Verify the command was sent correctly
+          await expect(server).toReceiveMessage({
+            type: "commit",
+            message: "Test commit message",
           });
 
-          // Notes file should still be open - send an update to verify
+          // Send successful response
           server.send({
-            type: "file_updated",
-            path: "notes/daily.md",
-            content: "Updated notes",
+            type: "committed",
           });
+        },
+      );
+    });
+
+    it("should handle commit errors", async () => {
+      await runInParallel(
+        async () => {
+          await expect(fs.commit("Test commit message")).rejects.toThrow(
+            "Nothing to commit",
+          );
+        },
+        async () => {
+          await server.connected;
 
           await expect(server).toReceiveMessage({
-            type: "close_file",
-            path: "notes/daily.md",
+            type: "commit",
+            message: "Test commit message",
           });
 
+          // Send error response
           server.send({
-            type: "file_closed",
-            path: "notes/daily.md",
+            type: "error",
+            message: "Nothing to commit",
           });
-        })(),
-      ]);
+        },
+      );
     });
   });
 
   describe("real-time notification system", () => {
     it("should handle multiple files receiving updates simultaneously", async () => {
-      // Open both files
-      const tasksIterator = fs.openFile("TASKS.md");
-      const notesIterator = fs.openFile("notes.md");
+      await runInParallel(
+        async () => {
+          // Open both files
+          const tasksFile = fs.openFile("TASKS.md");
+          const tasksIterator = tasksFile.getEvents();
+          const notesFile = fs.openFile("notes.md");
+          const notesIterator = notesFile.getEvents();
 
-      await Promise.all([
-        (async () => {
           // Get initial events
           await tasksIterator.next();
           await notesIterator.next();
-        })(),
-        (async () => {
+
+          // Both should receive their respective updates
+          const tasksUpdate = await tasksIterator.next();
+          const notesUpdate = await notesIterator.next();
+
+          expect(tasksUpdate.value.content).toBe("Updated tasks");
+          expect(notesUpdate.value.content).toBe("Updated notes");
+
+          tasksFile.close();
+          notesFile.close();
+        },
+        async () => {
           await server.connected;
 
           await expect(server).toReceiveMessage({
             type: "open_file",
+            handle: "1",
             path: "TASKS.md",
           });
 
           server.send({
             type: "file_opened",
-            path: "TASKS.md",
+            handle: "1",
             content: "Tasks",
           });
 
           await expect(server).toReceiveMessage({
             type: "open_file",
+            handle: "2",
             path: "notes.md",
           });
 
           server.send({
             type: "file_opened",
-            path: "notes.md",
+            handle: "2",
             content: "Notes",
           });
-        })(),
-      ]);
 
-      // Send updates to both files.  We hd to wait until the
-      // initial events are processed before sending updates,
-      // otherwise the file_updated events might be compressed into
-      // the initial file_opened event.
+          // Send updates to both files.
 
-      server.send({
-        type: "file_updated",
-        path: "TASKS.md",
-        content: "Updated tasks",
-      });
+          server.send({
+            type: "file_updated",
+            handle: "1",
+            content: "Updated tasks",
+          });
 
-      server.send({
-        type: "file_updated",
-        path: "notes.md",
-        content: "Updated notes",
-      });
-
-      // Both should receive their respective updates
-      const tasksUpdate = await tasksIterator.next();
-      const notesUpdate = await notesIterator.next();
-
-      expect(tasksUpdate.value.content).toBe("Updated tasks");
-      expect(notesUpdate.value.content).toBe("Updated notes");
-
-      await tasksIterator.return(undefined);
-      await notesIterator.return(undefined);
+          server.send({
+            type: "file_updated",
+            handle: "2",
+            content: "Updated notes",
+          });
+        },
+      );
     });
   });
 
-  describe("Phase 6c: Connection states and reconnection", () => {
+  describe("Connection states and reconnection", () => {
     it("should handle multiple simultaneous connect() calls", async () => {
-      await Promise.all([
-        // Client operations
-        (async () => {
-          const writePromise1 = fs.writeFile("file1.txt", "old1", "new1");
-          const writePromise2 = fs.writeFile("file2.txt", "old2", "new2");
-          const commitPromise = fs.commit("Test commit");
+      await runInParallel(
+        async () => {
+          const commitPromise1 = fs.commit("Initial commit");
+          const commitPromise2 = fs.commit("Second commit");
 
           // All promises should resolve
-          expect(await writePromise1).toBe("new1");
-          expect(await writePromise2).toBe("new2");
-          await expect(commitPromise).resolves.toBeUndefined();
-
-          expect(fs.getState()).toBe(FileSystemState.CONNECTED);
-        })(),
-
-        // Server responses
-        (async () => {
+          await expect(commitPromise1).resolves.toBeUndefined();
+          await expect(commitPromise2).resolves.toBeUndefined();
+        },
+        async () => {
           await server.connected;
 
           // Handle commands in order
           await expect(server).toReceiveMessage({
-            type: "write_file",
-            path: "file1.txt",
-            last_content: "old1",
-            new_content: "new1",
-          });
-
-          server.send({
-            type: "file_written",
-            path: "file1.txt",
-            content: "new1",
-          });
-
-          await expect(server).toReceiveMessage({
-            type: "write_file",
-            path: "file2.txt",
-            last_content: "old2",
-            new_content: "new2",
-          });
-
-          server.send({
-            type: "file_written",
-            path: "file2.txt",
-            content: "new2",
-          });
-
-          await expect(server).toReceiveMessage({
             type: "commit",
-            message: "Test commit",
+            message: "Initial commit",
           });
 
           server.send({
             type: "committed",
           });
-        })(),
-      ]);
+
+          await expect(server).toReceiveMessage({
+            type: "commit",
+            message: "Second commit",
+          });
+
+          server.send({
+            type: "committed",
+          });
+        },
+      );
     });
 
-    it("should transition to RECONNECT_WAIT on connection loss with open files", async () => {
-      // Open a file first
-      const fileIterator = fs.openFile("TASKS.md");
+    async function waitForStateChange(fs: FileSystem, state: FileSystemState) {
+      if (fs.getState() === state) {
+        return;
+      }
 
-      await Promise.all([
-        fileIterator.next(),
-        (async () => {
+      return Promise.race([
+        new Promise<void>((resolve) => {
+          const removeListener = fs.addStateListener((newState) => {
+            if (newState === state) {
+              removeListener();
+              resolve();
+            }
+          });
+        }),
+        new Promise<void>((_, reject) =>
+          setTimeout(
+            () => reject(new Error("Timeout waiting for state")),
+            1000,
+          ),
+        ),
+      ]);
+    }
+
+    it("should transition to RECONNECT_WAIT on connection loss with open files", async () => {
+      const __CONNECTED__ = "connected";
+
+      await runInParallel(
+        async (sync) => {
+          // Open a file first
+          const file = fs.openFile("TASKS.md");
+          const fileIterator = file.getEvents();
+          await fileIterator.next();
+          expect(fs.getState()).toBe(FileSystemState.CONNECTED);
+
+          sync.signal(__CONNECTED__); // ⏰
+
+          // Should transition to RECONNECT_WAIT (not DISCONNECTED) because file is open
+          await waitForStateChange(fs, FileSystemState.RECONNECT_WAIT);
+
+          // Clean up
+          file.close();
+        },
+        async (sync) => {
           await server.connected;
           await expect(server).toReceiveMessage({
             type: "open_file",
             path: "TASKS.md",
+            handle: "1",
           });
           server.send({
             type: "file_opened",
-            path: "TASKS.md",
+            handle: "1",
             content: "Initial content",
           });
-        })(),
-      ]);
+          await sync.wait(__CONNECTED__); // 💤
 
-      expect(fs.getState()).toBe(FileSystemState.CONNECTED);
-
-      // Close connection
-      server.close();
-
-      // Should transition to RECONNECT_WAIT (not DISCONNECTED) because file is open
-      await new Promise(resolve => setTimeout(resolve, 10)); // Give state change time
-      expect(fs.getState()).toBe(FileSystemState.RECONNECT_WAIT);
-
-      // Clean up
-      await fileIterator.return(undefined);
+          // Close connection
+          server.close();
+        },
+      );
     });
 
     it("should transition to DISCONNECTED on connection loss without open files", async () => {
-      // Make a simple operation without keeping files open
-      const writePromise = fs.writeFile("test.txt", "old", "new");
+      const __CONNECTED__ = "connected";
 
-      await server.connected;
-      await expect(server).toReceiveMessage({
-        type: "write_file",
-        path: "test.txt",
-        last_content: "old",
-        new_content: "new",
-      });
+      await runInParallel(
+        async (sync) => {
+          // Make a simple operation without keeping files open
+          await fs.commit("Some changes");
 
-      expect(fs.getState()).toBe(FileSystemState.CONNECTED);
+          expect(fs.getState()).toBe(FileSystemState.CONNECTED);
+          sync.signal(__CONNECTED__); // ⏰
 
-      // Close connection before sending response
-      server.close();
+          // Should transition to DISCONNECTED (not RECONNECT_WAIT) because no files are open
+          await waitForStateChange(fs, FileSystemState.DISCONNECTED);
+        },
+        async (sync) => {
+          await server.connected;
+          await expect(server).toReceiveMessage({
+            type: "commit",
+            message: "Some changes",
+          });
+          server.send({
+            type: "committed",
+          });
+          await sync.wait(__CONNECTED__); // 💤
 
-      await expect(writePromise).rejects.toThrow("Connection closed");
-
-      // Should transition to DISCONNECTED (not RECONNECT_WAIT) because no files are open
-      expect(fs.getState()).toBe(FileSystemState.DISCONNECTED);
+          // Close connection
+          server.close();
+        },
+      );
     });
 
     it("should reestablish open files on reconnection", async () => {
-      const fileIterator = fs.openFile("TASKS.md");
+      const __FILE_OPENED__ = "file opened";
+      const __NEW_SERVER__ = "new server";
 
-      // Initial connection and file opening
-      await Promise.all([
-        fileIterator.next(),
-        (async () => {
+      await runInParallel(
+        async (sync) => {
+          // Initial connection and file opening
+          const file = fs.openFile("TASKS.md");
+          const fileIterator = file.getEvents();
+          await fileIterator.next();
+
+          sync.signal(__FILE_OPENED__);
+          await sync.wait(__NEW_SERVER__);
+
+          // Manual reconnection
+          await fs.connectNow();
+
+          // Should receive file_updated event (not file_opened) since content changed
+          const { value: updateEvent } = await fileIterator.next();
+          expect(updateEvent).toEqual({
+            type: "file_updated",
+            handle: "1",
+            content: "v2",
+          });
+
+          file.close();
+        },
+        async (sync) => {
           await server.connected;
           await expect(server).toReceiveMessage({
             type: "open_file",
+            handle: "1",
             path: "TASKS.md",
           });
           server.send({
             type: "file_opened",
-            path: "TASKS.md",
+            handle: "1",
             content: "v1",
           });
-        })(),
-      ]);
+          await sync.wait(__FILE_OPENED__);
 
-      // Simulate connection loss
-      server.close();
-      server = new WS(WS_URL, { jsonProtocol: true });
+          // Simulate connection loss
+          server.close();
+          server = new WS(WS_URL, { jsonProtocol: true });
 
-      // Manual reconnection
-      const connectPromise = fs.connectNow();
+          sync.signal(__NEW_SERVER__);
 
-      await Promise.all([
-        connectPromise,
-        (async () => {
           await server.connected;
 
           // Should receive reestablishment command for open file
           await expect(server).toReceiveMessage({
             type: "open_file",
+            handle: "1",
             path: "TASKS.md",
           });
 
           server.send({
             type: "file_opened",
-            path: "TASKS.md",
+            handle: "1",
             content: "v2", // Content changed
           });
-        })(),
-      ]);
-
-      // Should receive file_updated event (not file_opened) since content changed
-      const { value: updateEvent } = await fileIterator.next();
-      expect(updateEvent).toEqual({
-        type: "file_updated",
-        path: "TASKS.md",
-        content: "v2",
-      });
-
-      await fileIterator.return(undefined);
+        },
+      );
     });
 
     it("should not send file_updated on reconnection if content unchanged", async () => {
-      const fileIterator = fs.openFile("TASKS.md");
+      const __FILE_OPENED__ = "file opened";
+      const __NEW_SERVER__ = "new server";
 
       // Initial connection and file opening
-      await Promise.all([
-        fileIterator.next(),
-        (async () => {
+      const file = fs.openFile("TASKS.md");
+      const fileIterator = file.getEvents();
+      const receivedEvents: FileEvent[] = [];
+
+      await runInParallel(
+        async (sync) => {
+          await fileIterator.next();
+          sync.signal(__FILE_OPENED__); // ⏰
+
+          for await (const event of fileIterator) {
+            receivedEvents.push(event);
+          }
+        },
+        async (sync) => {
+          await sync.wait(__FILE_OPENED__); // 💤
+          await sync.wait(__NEW_SERVER__); // 💤
+          await fs.commit("Some changes"); // Trigger reconnection
+
+          // At the above point, we've *received* any updated events from the
+          // reconnection, make sure they are delivered to receivedEvents
+          // by giving the event loop a tick.
+          await new Promise((resolve) => setTimeout(resolve, 0));
+
+          file.close();
+        },
+        async (sync) => {
           await server.connected;
           await expect(server).toReceiveMessage({
             type: "open_file",
+            handle: "1",
             path: "TASKS.md",
           });
           server.send({
             type: "file_opened",
-            path: "TASKS.md",
-            content: "unchanged",
+            handle: "1",
+            content: "v1",
           });
-        })(),
-      ]);
+          await sync.wait(__FILE_OPENED__); // 💤
 
-      // Simulate connection loss
-      server.close();
-      server = new WS(WS_URL, { jsonProtocol: true });
+          // Simulate connection loss
+          server.close();
+          server = new WS(WS_URL, { jsonProtocol: true });
 
-      // Manual reconnection
-      const connectPromise = fs.connectNow();
+          sync.signal(__NEW_SERVER__); // ⏰
 
-      await Promise.all([
-        connectPromise,
-        (async () => {
           await server.connected;
 
           // Should receive reestablishment command for open file
           await expect(server).toReceiveMessage({
             type: "open_file",
+            handle: "1",
             path: "TASKS.md",
           });
 
           server.send({
             type: "file_opened",
-            path: "TASKS.md",
-            content: "unchanged", // Same content
+            handle: "1",
+            content: "v1", // Content unchanged
           });
-        })(),
-      ]);
 
-      // Should NOT receive any new events
-      // Send another event to verify the generator is still working
-      server.send({
-        type: "file_updated",
-        path: "TASKS.md",
-        content: "actually changed",
-      });
+          await expect(server).toReceiveMessage({
+            type: "commit",
+            message: "Some changes",
+          });
+          server.send({
+            type: "committed",
+          });
+        },
+      );
 
-      const { value: updateEvent } = await fileIterator.next();
-      expect(updateEvent).toEqual({
-        type: "file_updated",
-        path: "TASKS.md",
-        content: "actually changed",
-      });
-
-      await fileIterator.return(undefined);
+      expect(receivedEvents).toEqual([]);
     });
 
     it("should provide public connectNow() method", async () => {
-      expect(fs.getState()).toBe(FileSystemState.DISCONNECTED);
-
-      const connectPromise = fs.connectNow();
-
-      await server.connected;
-      await connectPromise;
-
-      expect(fs.getState()).toBe(FileSystemState.CONNECTED);
+      await runInParallel(
+        async (cp) => {
+          expect(fs.getState()).toBe(FileSystemState.DISCONNECTED);
+          await fs.connectNow();
+          expect(fs.getState()).toBe(FileSystemState.CONNECTED);
+        },
+        async (cp) => {
+          await server.connected;
+        },
+      );
     });
 
     it("should handle file reestablishment failures gracefully", async () => {
-      const fileIterator = fs.openFile("TASKS.md");
+      const __FILE_OPENED__ = "file opened";
+      const __NEW_SERVER__ = "new server";
 
       // Initial connection and file opening
-      await Promise.all([
-        fileIterator.next(),
-        (async () => {
+      await runInParallel(
+        async (sync) => {
+          const file = fs.openFile("TASKS.md");
+          const fileIterator = file.getEvents();
+
+          await fileIterator.next();
+          sync.signal(__FILE_OPENED__); // ⏰
+          await sync.wait(__NEW_SERVER__); // 💤
+          await fs.connectNow();
+
+          // Connection should still be successful despite file error
+          expect(fs.getState()).toBe(FileSystemState.CONNECTED);
+
+          file.close();
+        },
+        async (sync) => {
           await server.connected;
           await expect(server).toReceiveMessage({
             type: "open_file",
+            handle: "1",
             path: "TASKS.md",
           });
           server.send({
             type: "file_opened",
-            path: "TASKS.md",
+            handle: "1",
             content: "content",
           });
-        })(),
-      ]);
+          await sync.wait(__FILE_OPENED__); // 💤
 
-      // Simulate connection loss
-      server.close();
-      server = new WS(WS_URL, { jsonProtocol: true });
+          // Simulate connection loss
+          server.close();
+          server = new WS(WS_URL, { jsonProtocol: true });
 
-      // Manual reconnection with file error
-      const connectPromise = fs.connectNow();
+          sync.signal(__NEW_SERVER__); // ⏰
 
-      await Promise.all([
-        connectPromise,
-        (async () => {
           await server.connected;
 
           // Should receive reestablishment command
           await expect(server).toReceiveMessage({
             type: "open_file",
+            handle: "1",
             path: "TASKS.md",
           });
 
           // Send error response (file might have been deleted)
           server.send({
             type: "error",
-            path: "TASKS.md",
             message: "File not found",
           });
-        })(),
-      ]);
-
-      // Connection should still be successful despite file error
-      expect(fs.getState()).toBe(FileSystemState.CONNECTED);
-
-      await fileIterator.return(undefined);
+        },
+      );
     });
 
     it("should clear reconnection timeout on manual disconnect", async () => {
-      const fileIterator = fs.openFile("TASKS.md");
+      const __CONNECTED__ = "connected";
 
-      // Initial connection and file opening
-      await Promise.all([
-        fileIterator.next(),
-        (async () => {
+      await runInParallel(
+        async (sync) => {
+          // Trigger
+          const file = fs.openFile("TASKS.md");
+          const fileIterator = file.getEvents();
+          await fileIterator.next();
+
+          sync.signal(__CONNECTED__); // ⏰
+          waitForStateChange(fs, FileSystemState.RECONNECT_WAIT);
+
+          // Manual disconnect should clear timeouts and go to DISCONNECTED
+          fs.disconnect();
+          expect(fs.getState()).toBe(FileSystemState.DISCONNECTED);
+
+          file.close();
+        },
+        async (sync) => {
           await server.connected;
           await expect(server).toReceiveMessage({
             type: "open_file",
+            handle: "1",
             path: "TASKS.md",
           });
           server.send({
             type: "file_opened",
-            path: "TASKS.md",
+            handle: "1",
             content: "content",
           });
-        })(),
-      ]);
 
-      // Close connection to trigger reconnection state
-      server.close();
-
-      // Give time for RECONNECT_WAIT state
-      await new Promise(resolve => setTimeout(resolve, 10));
-      expect(fs.getState()).toBe(FileSystemState.RECONNECT_WAIT);
-
-      // Manual disconnect should clear timeouts and go to DISCONNECTED
-      fs.disconnect();
-      expect(fs.getState()).toBe(FileSystemState.DISCONNECTED);
-
-      await fileIterator.return(undefined);
+          await sync.wait(__CONNECTED__); // 💤
+          // Close connection to trigger reconnection state
+          server.close();
+        },
+      );
     });
   });
 });

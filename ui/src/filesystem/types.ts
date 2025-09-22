@@ -12,23 +12,24 @@ export type ServerEvent =
 export interface FileOpenedEvent {
   type: "file_opened";
   path: string;
+  handle: string;
   content: string;
 }
 
 export interface FileClosedEvent {
   type: "file_closed";
-  path: string;
+  handle: string;
 }
 
 export interface FileUpdatedEvent {
   type: "file_updated";
-  path: string;
+  handle: string;
   content: string;
 }
 
 export interface FileWrittenEvent {
   type: "file_written";
-  path: string;
+  handle: string;
   content: string;
 }
 
@@ -52,16 +53,17 @@ export type ClientCommand =
 export interface OpenFileCommand {
   type: "open_file";
   path: string;
+  handle: string;
 }
 
 export interface CloseFileCommand {
   type: "close_file";
-  path: string;
+  handle: string;
 }
 
 export interface WriteFileCommand {
   type: "write_file";
-  path: string;
+  handle: string;
   last_content: string;
   new_content: string;
 }
@@ -102,4 +104,19 @@ export class ConnectionClosedError extends FileSystemError {
     super(message, undefined, originalError);
     this.name = "ConnectionClosedError";
   }
+}
+
+// File interface for the revised client API
+export interface File {
+  // Get async generator for file events
+  getEvents(): AsyncGenerator<FileEvent>;
+
+  // Write to the file
+  writeFile(oldContent: string, newContent: string): Promise<string>;
+
+  // Close the file handle (explicit cleanup)
+  close(): void;
+
+  // Get the path for this file
+  readonly path: string;
 }
