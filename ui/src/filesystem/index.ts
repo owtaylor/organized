@@ -8,12 +8,9 @@ import {
   WriteFileCommand,
   CommitCommand,
   FileWrittenEvent,
-  CommittedEvent,
   OpenFileCommand,
   CloseFileCommand,
   File,
-  FileOpenedEvent,
-  FileUpdatedEvent,
 } from "./types.js";
 
 export type { FileEvent, FileSystemState, File };

@@ -1,16 +1,13 @@
 import { FC, useEffect, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { EditorController } from "../../controllers/EditorController";
+import type { EditorChildProps } from "./types";
 
-interface MarkdownPreviewProps {
-  controller: EditorController;
-  className?: string;
-}
-
-export const MarkdownPreview: FC<MarkdownPreviewProps> = ({
+export const MarkdownPreview: FC<EditorChildProps> = ({
   controller,
+  initialScrollPosition,
   className = "",
+  onScrollChange,
 }) => {
   const [content, setContent] = useState("");
 
@@ -47,3 +44,5 @@ export const MarkdownPreview: FC<MarkdownPreviewProps> = ({
     </div>
   );
 };
+
+MarkdownPreview.displayName = "MarkdownPreview";
