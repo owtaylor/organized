@@ -208,6 +208,7 @@ class FileSystem {
 
 We close a file by calling the close() method on the File object.
 
+
 ```
 useEffect(() => {
     let isActive = true;
@@ -245,6 +246,122 @@ useEffect(() => {
     };
 }, [filename]);
 ```
+
+== React component
+
+There is a React <Editor path="some/file.txt"/> component, that:
+ - Has a floating toolbar to switch mode edit/diff/preview
+ - Auto-writes using writeFile after WRITEBACK_SECONDS=10 of inactivity
+ - Gets the FileSystem from app level context
+
+The heart of the synchronization logic is handled by a controller class:
+
+```ts
+type ContentsChangedListener = (contents: string) => void;
+
+// Monaco Editor types (from @monaco-editor/react)
+interface IStandaloneCodeEditor {
+    // Monaco editor instance
+}
+
+interface IStandaloneDiffEditor {
+    // Monaco diff editor instance
+}
+
+class EditorController {
+    constructor(private fs: FileSystem, private path: string) {
+        // ...
+    }
+
+    setEditor(editor?: IStandaloneCodeEditor | IStandaloneDiffEditor) {
+        // ...
+    }
+
+    // The local contents matches the editor value, if an editor exists,
+    // otherwise is simply kept in a property
+    get localContents(): string {
+        // ....
+    }
+
+    get committedContents(): string {
+        // ....
+    }
+
+    addLocalContentsChangedListener(listener: ContentsChangedListener) {
+        // ....
+    }
+
+    addCommittedContentsChangedListener(listener: ContentsChangedListener) {
+        // ...
+    }
+
+    dispose() {
+        // Cleanup resources, close file handles, etc.
+    }
+
+}
+```
+
+The usage of this in the component looks something like:
+
+```tsx
+      const fs = useContext(FileSystemContext);
+
+      useEffect(() => {
+        const controller = new EditorController(fs, path);
+        controllerRef.current = controller;
+        // We avoid tracking the current local contents as state
+        // to avoid a rerendering per keystroke, but we *do* need
+        // it as state when we're in preview mode.
+        controller.addLocalContentsChangedListener((contents) => {
+            if (modeRef.current === "preview") {
+                setPreviewContents(contents);
+            }
+        });
+        controller.addCommittedContentsChangedListener((contents) => {
+            setCommittedContents(contents);
+        });
+
+        return () => {
+            controllerRef.current?.dispose();
+            controllerRef.current = null;
+        }
+      }, [fs, path]);
+      useEffect(() => {
+          modeRef.current = mode;
+          if (mode === "preview" && controllerRef.current) {
+            setPreviewContents(controllerRef.current.localContents);
+        }
+      }, [mode]);
+      /* ... */
+      <div className="h-full">
+        {mode === "edit" && (
+          <MonacoEditor
+            editorDidMount={handleEditorDidMount}
+            editorWillMount={handleEditorWillUnmount}
+            defaultValue={controllerRef.current?.localContents}
+            /* ... */
+          />
+        )}
+        {mode === "diff" && (
+          <DiffEditor
+            editorDidMount={handleEditorDidMount}
+            editorWillMount={handleEditorWillUnmount}
+            defaultValue={controllerRef.current?.localContents}
+            original={committedContents}
+            /* ... */
+          />
+        )}
+        {mode === "preview" && (
+          <div className="h-full overflow-auto p-4">
+            <div className="prose prose-lg max-w-none">
+              <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                {previewContents ?? ""}
+              </ReactMarkdown>
+            </div>
+          </div>
+        )}
+``` 
 
 == Details of client synchronization algorithm
 
@@ -491,9 +608,47 @@ and notify if necessary.
 - ✅ Implemented new TypeScript client with File object interface
 - ✅ Incorporated protocol changes into main FILESYSTEM_DESIGN.md documentation
 
-**Phase 8: React Integration** 🚧 TODO
-- Integrate TypeScript FileSystem with React application
-- Keep a FileSystem object at the top of the application using the react context API
-- Create a new editor component that uses the Fi    leSystem API to edit a particular
-  file.
-- Replace existing /api/files/TASKS.md editor with the new editor component
+**Phase 8: React Integration**
+
+**Phase 8a: Basic FileSystem Integration** ✅ COMPLETED
+- ✅ COMPLETED: FileSystem Context Provider (`ui/src/contexts/FileSystemContext.tsx`)
+  - Single FileSystem instance shared across React app via context
+  - Connection state tracking and listener management
+  - WebSocket URL configuration (`ws://localhost:8080/ws`)
+- ✅ COMPLETED: EditorController Implementation (`ui/src/controllers/EditorController.ts`)
+  - Type-safe discriminated union for editor state (code/diff/none)
+  - Separate `setCodeEditor()` and `setDiffEditor()` methods for Monaco integration
+  - Three-way content split: local/remote/committed contents tracking
+  - Auto-save with 10-second debounce timer
+  - Dual file handle management (working file + `@file` committed version)
+  - Simple last-wins synchronization (full algorithm in Phase 8c)
+- ✅ COMPLETED: Complete Editor Component Restructuring (`ui/src/Editor.tsx`)
+  - New path-based API: `<Editor path="TASKS.md" />` instead of content props
+  - Internal EditorController encapsulation - no external file management needed
+  - Unmanaged Monaco editors following FILESYSTEM_DESIGN.md pattern (no keystroke re-renders)
+  - Enhanced type safety with separate mount handlers for code vs diff editors
+- ✅ COMPLETED: Aggressive App.tsx Simplification (`ui/src/App.tsx`)
+  - Removed all HTTP-based file fetching and state management
+  - Removed auto-save logic, markdown state, and change handlers
+  - Clean separation: App handles navigation/layout, Editor handles file operations
+  - Wrapped in FileSystemProvider for context access
+
+**Phase 8b: Connection State & Polish** 🚧 TODO
+- Add connection status UI component showing FileSystem state
+- "Connect Now" button for RECONNECT_WAIT state
+- Integration with react-hot-toast for connection notifications
+- Enhanced error handling and graceful degradation when disconnected
+
+**Phase 8c: Full Synchronization Algorithm** 🚧 TODO
+- Add diff-match-patch dependency (`npm install diff-match-patch @types/diff-match-patch`)
+- Implement advanced EditorController synchronization:
+  - Standard mode: rebase local changes onto server updates using diff-match-patch
+  - Save mode: ignore updates during save, then rebase after file_written response
+  - Graceful merge conflict handling with change discarding
+- Replace simple last-wins behavior with intelligent three-way merging
+
+**Phase 8d: Testing & Refinement** 🚧 TODO
+- Unit tests for EditorController synchronization logic
+- Integration tests for React components with FileSystem
+- Performance optimization and memory management
+- Error boundary and recovery mechanisms

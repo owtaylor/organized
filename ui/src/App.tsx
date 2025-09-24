@@ -1,62 +1,17 @@
-import { useEffect, useRef, useState } from "react";
+import { useState } from "react";
 import Editor from "./Editor";
 import Chat from "./Chat";
 import Notes from "./Notes";
-import { Toaster, toast } from "react-hot-toast";
+import { Toaster } from "react-hot-toast";
+import { FileSystemProvider } from "./contexts/FileSystemContext";
 
 type Tab = "tasks" | "notes";
 
 function App() {
-  const timeoutRef = useRef<NodeJS.Timeout | null>(null);
-  const [markdown, setMarkdown] = useState("");
-  const [committedMarkdown, setCommittedMarkdown] = useState("");
   const [activeTab, setActiveTab] = useState<Tab>("tasks");
 
-  useEffect(() => {
-    const fetchTasks = async () => {
-      try {
-        const [workingResponse, committedResponse] = await Promise.all([
-          fetch("/api/files/TASKS.md"),
-          fetch("/api/files/TASKS.md?committed=true"),
-        ]);
-        const workingData = await workingResponse.text();
-        const committedData = await committedResponse.text();
-        setMarkdown(workingData);
-        setCommittedMarkdown(committedData);
-      } catch (error) {
-        console.error("Error fetching tasks:", error);
-        toast.error("Failed to fetch tasks.");
-      }
-    };
-
-    fetchTasks();
-  }, []);
-
-
-  const handleEditorChange = (newMarkdown: string) => {
-    setMarkdown(newMarkdown);
-    if (timeoutRef.current) {
-      clearTimeout(timeoutRef.current);
-    }
-    timeoutRef.current = setTimeout(async () => {
-      try {
-        await fetch("/api/files/TASKS.md", {
-          method: "POST",
-          headers: {
-            "Content-Type": "text/plain",
-          },
-          body: newMarkdown,
-        });
-        toast.success("Tasks saved!");
-      } catch (error) {
-        console.error("Error saving tasks:", error);
-        toast.error("Failed to save tasks.");
-      }
-    }, 10000);
-  };
-
   return (
-    <>
+    <FileSystemProvider>
       <Toaster />
       <div className="flex h-screen">
         <div className="flex w-3/4 flex-col">
@@ -80,12 +35,8 @@ function App() {
           </div>
           <div className="flex-grow overflow-y-auto">
             {activeTab === "tasks" ? (
-              <div className="p-4 h-full">
-                <Editor
-                  markdown={markdown}
-                  diffMarkdown={committedMarkdown}
-                  onChange={handleEditorChange}
-                />
+              <div className="h-full p-4">
+                <Editor path="TASKS.md" />
               </div>
             ) : (
               <Notes />
@@ -98,7 +49,7 @@ function App() {
           </div>
         </div>
       </div>
-    </>
+    </FileSystemProvider>
   );
 }
 
