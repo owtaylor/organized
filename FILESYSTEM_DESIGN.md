@@ -247,121 +247,20 @@ useEffect(() => {
 }, [filename]);
 ```
 
-== React component
+== React component architecture
 
-There is a React <Editor path="some/file.txt"/> component, that:
- - Has a floating toolbar to switch mode edit/diff/preview
- - Auto-writes using writeFile after WRITEBACK_SECONDS=10 of inactivity
- - Gets the FileSystem from app level context
+The React editor uses a clean component architecture with direct Monaco editor integration:
 
-The heart of the synchronization logic is handled by a controller class:
+**Main Editor Component**: The `<Editor path="some/file.txt"/>` component provides a floating toolbar to switch between edit/diff/preview modes and manages the overall editor state. It gets the FileSystem from React context and creates an EditorController instance.
 
-```ts
-type ContentsChangedListener = (contents: string) => void;
+**EditorController**: This class handles the core synchronization logic between the filesystem protocol and Monaco editor models. It creates and manages Monaco ITextModel instances for both working and committed file versions, automatically syncing content changes with the filesystem. The controller provides auto-save functionality with a 10-second debounce timer and manages the three-way content split (local/remote/committed).
 
-// Monaco Editor types (from @monaco-editor/react)
-interface IStandaloneCodeEditor {
-    // Monaco editor instance
-}
+**Component Structure**: The editor is split into specialized components in `src/components/editor/`:
+- **CodeEditor**: Creates and manages a Monaco standalone code editor, directly setting the working model
+- **DiffEditor**: Creates a Monaco diff editor comparing committed vs working models
+- **MarkdownPreview**: Renders markdown content using ReactMarkdown, listening to model changes
 
-interface IStandaloneDiffEditor {
-    // Monaco diff editor instance
-}
-
-class EditorController {
-    constructor(private fs: FileSystem, private path: string) {
-        // ...
-    }
-
-    setEditor(editor?: IStandaloneCodeEditor | IStandaloneDiffEditor) {
-        // ...
-    }
-
-    // The local contents matches the editor value, if an editor exists,
-    // otherwise is simply kept in a property
-    get localContents(): string {
-        // ....
-    }
-
-    get committedContents(): string {
-        // ....
-    }
-
-    addLocalContentsChangedListener(listener: ContentsChangedListener) {
-        // ....
-    }
-
-    addCommittedContentsChangedListener(listener: ContentsChangedListener) {
-        // ...
-    }
-
-    dispose() {
-        // Cleanup resources, close file handles, etc.
-    }
-
-}
-```
-
-The usage of this in the component looks something like:
-
-```tsx
-      const fs = useContext(FileSystemContext);
-
-      useEffect(() => {
-        const controller = new EditorController(fs, path);
-        controllerRef.current = controller;
-        // We avoid tracking the current local contents as state
-        // to avoid a rerendering per keystroke, but we *do* need
-        // it as state when we're in preview mode.
-        controller.addLocalContentsChangedListener((contents) => {
-            if (modeRef.current === "preview") {
-                setPreviewContents(contents);
-            }
-        });
-        controller.addCommittedContentsChangedListener((contents) => {
-            setCommittedContents(contents);
-        });
-
-        return () => {
-            controllerRef.current?.dispose();
-            controllerRef.current = null;
-        }
-      }, [fs, path]);
-      useEffect(() => {
-          modeRef.current = mode;
-          if (mode === "preview" && controllerRef.current) {
-            setPreviewContents(controllerRef.current.localContents);
-        }
-      }, [mode]);
-      /* ... */
-      <div className="h-full">
-        {mode === "edit" && (
-          <MonacoEditor
-            editorDidMount={handleEditorDidMount}
-            editorWillMount={handleEditorWillUnmount}
-            defaultValue={controllerRef.current?.localContents}
-            /* ... */
-          />
-        )}
-        {mode === "diff" && (
-          <DiffEditor
-            editorDidMount={handleEditorDidMount}
-            editorWillMount={handleEditorWillUnmount}
-            defaultValue={controllerRef.current?.localContents}
-            original={committedContents}
-            /* ... */
-          />
-        )}
-        {mode === "preview" && (
-          <div className="h-full overflow-auto p-4">
-            <div className="prose prose-lg max-w-none">
-              <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                {previewContents ?? ""}
-              </ReactMarkdown>
-            </div>
-          </div>
-        )}
-``` 
+**State Management**: The architecture avoids re-rendering on every keystroke by managing editor content through Monaco models rather than React state. Only the markdown preview mode requires React state updates for content rendering. 
 
 == Details of client synchronization algorithm
 

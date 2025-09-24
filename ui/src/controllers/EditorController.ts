@@ -1,23 +1,22 @@
 import FileSystem, { File, FileEvent } from "../filesystem";
 import type { editor as MonacoEditorType, IDisposable } from "monaco-editor";
+import { monaco } from "../monaco-setup";
 
 type ContentsChangedListener = (contents: string) => void;
-
-type EditorState =
-  | { type: "code"; editor: MonacoEditorType.IStandaloneCodeEditor }
-  | { type: "diff"; editor: MonacoEditorType.IStandaloneDiffEditor }
-  | { type: "none" };
 
 export class EditorController {
   private workingFile: File | null = null;
   private committedFile: File | null = null;
-  private _editor: EditorState = { type: "none" };
   private editorCleanups: IDisposable[] = []; // Track editor listener disposals
 
   // Three-way content split:
   private _localContents = ""; // Current editor value (user's edits)
   private _remoteContents = ""; // Latest from server (working file)
   private _committedContents = ""; // Latest committed version (@file)
+
+  // Monaco models
+  private _workingModel: MonacoEditorType.ITextModel | null = null;
+  private _committedModel: MonacoEditorType.ITextModel | null = null;
 
   private localListeners = new Set<ContentsChangedListener>();
   private committedListeners = new Set<ContentsChangedListener>();
@@ -28,7 +27,46 @@ export class EditorController {
     private fs: FileSystem,
     private path: string,
   ) {
+    this.initModels();
     this.init();
+  }
+
+  private initModels() {
+    // Create Monaco text models
+    const uri = monaco.Uri.parse(`file:///${this.path}`);
+    const committedUri = monaco.Uri.parse(`file:///${this.path}.committed`);
+
+    this._workingModel = monaco.editor.createModel(
+      "", // Start with empty content, will be updated by file events
+      "markdown",
+      uri,
+    );
+
+    this._committedModel = monaco.editor.createModel(
+      "", // Start with empty content, will be updated by file events
+      "markdown",
+      committedUri,
+    );
+
+    // Listen to working model content changes for local edits
+    this._workingModel.onDidChangeContent(() => {
+      const newContent = this._workingModel?.getValue() || "";
+      this.updateLocalContents(newContent);
+    });
+  }
+
+  getWorkingModel(): MonacoEditorType.ITextModel {
+    if (!this._workingModel) {
+      throw new Error("Working model not initialized");
+    }
+    return this._workingModel;
+  }
+
+  getCommittedModel(): MonacoEditorType.ITextModel {
+    if (!this._committedModel) {
+      throw new Error("Committed model not initialized");
+    }
+    return this._committedModel;
   }
 
   private async init() {
@@ -46,12 +84,13 @@ export class EditorController {
         this._localContents = content;
         console.debug("Local contents updated to:", this._localContents);
 
-        console.debug("Editor is", this._editor);
-        if (this._editor.type === "code") {
-          console.debug("Updating code editor content to ", content);
-          this._editor.editor.setValue(content);
-        } else if (this._editor.type === "diff") {
-          this._editor.editor.getModifiedEditor().setValue(content);
+        // Update the working model - this will automatically update any connected editors
+        if (this._workingModel) {
+          // Temporarily disable the model change listener to avoid recursive updates
+          const currentValue = this._workingModel.getValue();
+          if (currentValue !== content) {
+            this._workingModel.setValue(content);
+          }
         }
 
         this.notifyLocalListeners();
@@ -59,6 +98,15 @@ export class EditorController {
 
       this.watchFile(this.committedFile, (content) => {
         this._committedContents = content;
+
+        // Update the committed model
+        if (this._committedModel) {
+          const currentValue = this._committedModel.getValue();
+          if (currentValue !== content) {
+            this._committedModel.setValue(content);
+          }
+        }
+
         this.notifyCommittedListeners();
       });
     } catch (error) {
@@ -86,49 +134,6 @@ export class EditorController {
 
   get committedContents(): string {
     return this._committedContents;
-  }
-
-  get editor(): EditorState {
-    return this._editor;
-  }
-
-  setCodeEditor(editor: MonacoEditorType.IStandaloneCodeEditor) {
-    this.clearEditor();
-    this._editor = { type: "code", editor };
-
-    console.debug(
-      "New editor, Setting code editor content to ",
-      this._localContents,
-    );
-    editor.setValue(this._localContents);
-
-    const disposable = editor.onDidChangeModelContent(() => {
-      console.debug("onDidChangeModelContent fired");
-      const newContent = editor.getValue();
-      this.updateLocalContents(newContent);
-    });
-    this.editorCleanups.push(disposable);
-  }
-
-  setDiffEditor(editor: MonacoEditorType.IStandaloneDiffEditor) {
-    this.clearEditor();
-    this._editor = { type: "diff", editor };
-
-    const modifiedEditor = editor.getModifiedEditor();
-    modifiedEditor.setValue(this._localContents);
-
-    const disposable = modifiedEditor.onDidChangeModelContent(() => {
-      const newContent = modifiedEditor.getValue();
-      this.updateLocalContents(newContent);
-    });
-    this.editorCleanups.push(disposable);
-  }
-
-  clearEditor() {
-    // Clean up any existing editor listeners
-    this.editorCleanups.forEach((disposable) => disposable.dispose());
-    this.editorCleanups = [];
-    this._editor = { type: "none" };
   }
 
   updateLocalContents(newContent: string) {
@@ -200,6 +205,17 @@ export class EditorController {
     if (this.autoSaveTimeoutId) {
       clearTimeout(this.autoSaveTimeoutId);
       this.autoSaveTimeoutId = null;
+    }
+
+    // Dispose Monaco models
+    if (this._workingModel) {
+      this._workingModel.dispose();
+      this._workingModel = null;
+    }
+
+    if (this._committedModel) {
+      this._committedModel.dispose();
+      this._committedModel = null;
     }
 
     if (this.workingFile) {
