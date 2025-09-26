@@ -33,19 +33,14 @@ export class EditorController {
 
   private initModels() {
     // Create Monaco text models
-    const uri = monaco.Uri.parse(`file:///${this.path}`);
-    const committedUri = monaco.Uri.parse(`file:///${this.path}.committed`);
-
     this._workingModel = monaco.editor.createModel(
       "", // Start with empty content, will be updated by file events
       "markdown",
-      uri,
     );
 
     this._committedModel = monaco.editor.createModel(
       "", // Start with empty content, will be updated by file events
       "markdown",
-      committedUri,
     );
 
     // Listen to working model content changes for local edits
