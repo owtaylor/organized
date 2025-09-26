@@ -18,7 +18,7 @@ interface EditorProps {
 const Editor: FC<EditorProps> = ({ path }) => {
   const { fileSystem } = useFileSystem();
   const [mode, setMode] = useState<EditorMode>("edit");
-  const controllerRef = useRef<EditorController | null>(null);
+  const [controller, setController] = useState<EditorController | null>(null);
   const scrollPositionsRef = useRef<{
     [key in EditorMode]?: ScrollPosition;
   }>({});
@@ -26,10 +26,11 @@ const Editor: FC<EditorProps> = ({ path }) => {
 
   useEffect(() => {
     const controller = new EditorController(fileSystem, path);
-    controllerRef.current = controller;
+    setController(controller);
 
     return () => {
       controller.dispose();
+      setController(null);
     };
   }, [fileSystem, path]);
 
@@ -119,25 +120,25 @@ const Editor: FC<EditorProps> = ({ path }) => {
 
       {/* Editor Content */}
       <div className="h-full">
-        {mode === "edit" && controllerRef.current && (
+        {mode === "edit" && controller && (
           <CodeEditor
-            controller={controllerRef.current}
+            controller={controller}
             initialScrollPosition={scrollPositionsRef.current.edit}
             onScrollChange={handleScrollChange}
           />
         )}
 
-        {mode === "diff" && controllerRef.current && (
+        {mode === "diff" && controller && (
           <DiffEditor
-            controller={controllerRef.current}
+            controller={controller}
             initialScrollPosition={scrollPositionsRef.current.diff}
             onScrollChange={handleScrollChange}
           />
         )}
 
-        {mode === "preview" && controllerRef.current && (
+        {mode === "preview" && controller && (
           <MarkdownPreview
-            controller={controllerRef.current}
+            controller={controller}
             initialScrollPosition={scrollPositionsRef.current.preview}
             onScrollChange={handleScrollChange}
           />
