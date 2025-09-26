@@ -4,7 +4,6 @@ import {
   DocumentPlusIcon,
   EyeIcon,
 } from "@heroicons/react/24/outline";
-import type { IRange } from "monaco-editor";
 import { useFileSystem } from "./contexts/FileSystemContext";
 import { EditorController } from "./controllers/EditorController";
 import { CodeEditor, DiffEditor, MarkdownPreview } from "./components/editor";

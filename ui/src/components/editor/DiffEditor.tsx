@@ -1,10 +1,6 @@
 import { FC, useEffect, useRef, useState } from "react";
 import { monaco } from "../../monaco-setup";
-import type {
-  editor as MonacoEditorType,
-  IRange,
-  IDisposable,
-} from "monaco-editor";
+import type { editor as MonacoEditorType, IDisposable } from "monaco-editor";
 import type { EditorChildProps } from "./types";
 
 export const DiffEditor: FC<EditorChildProps> = ({
