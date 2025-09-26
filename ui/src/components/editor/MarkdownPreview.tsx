@@ -1,7 +1,6 @@
-import { FC, useEffect, useState } from "react";
-import ReactMarkdown from "react-markdown";
-import remarkGfm from "remark-gfm";
+import { FC, useEffect, useState, useRef, useLayoutEffect } from "react";
 import type { EditorChildProps } from "./types";
+import { LineNumberedMarkdown, LineNumberMapper } from "./LineNumberedMarkdown";
 
 export const MarkdownPreview: FC<EditorChildProps> = ({
   controller,
@@ -10,8 +9,12 @@ export const MarkdownPreview: FC<EditorChildProps> = ({
   onScrollChange,
 }) => {
   const [content, setContent] = useState("");
+  const containerRef = useRef<HTMLDivElement>(null);
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const mapperRef = useRef<LineNumberMapper>(null);
 
   useEffect(() => {
+    console.log("Use effect for controller");
     // Get initial content from the working model
     try {
       const workingModel = controller.getWorkingModel();
@@ -36,10 +39,55 @@ export const MarkdownPreview: FC<EditorChildProps> = ({
     }
   }, [controller]);
 
+  useLayoutEffect(() => {
+    if (scrollRef.current && containerRef.current) {
+      mapperRef.current = new LineNumberMapper(
+        scrollRef.current,
+        content.split("\n").length,
+      );
+
+      if (initialScrollPosition) {
+        const yPosition = mapperRef.current.lineNumberToYPosition(
+          initialScrollPosition.topLineNumber,
+          initialScrollPosition.topLineDelta,
+        );
+
+        if (yPosition !== null) {
+          const containerRect = containerRef.current.getBoundingClientRect();
+          const currentOffset = yPosition - containerRect.top;
+          containerRef.current.scrollTop += currentOffset;
+        }
+      }
+    }
+  }, [content, initialScrollPosition]);
+
+  // Handle scroll change events
+  useLayoutEffect(() => {
+    if (!onScrollChange || !containerRef.current) {
+      return;
+    }
+
+    const container = containerRef.current;
+
+    const handleScroll = () => {
+      if (mapperRef.current && containerRef.current) {
+        const boundingRect = container.getBoundingClientRect();
+        const { line, delta } = mapperRef.current.yPositionToLineNumber(
+          boundingRect.top,
+        );
+
+        onScrollChange({ topLineNumber: line, topLineDelta: delta });
+      }
+    };
+
+    container.addEventListener("scroll", handleScroll);
+    return () => container.removeEventListener("scroll", handleScroll);
+  }, [onScrollChange]);
+
   return (
-    <div className={`h-full overflow-auto p-4 ${className}`}>
-      <div className="prose prose-lg max-w-none">
-        <ReactMarkdown remarkPlugins={[remarkGfm]}>{content}</ReactMarkdown>
+    <div ref={containerRef} className={`h-full overflow-auto p-4 ${className}`}>
+      <div ref={scrollRef} className="prose prose-lg max-w-none">
+        <LineNumberedMarkdown>{content}</LineNumberedMarkdown>
       </div>
     </div>
   );
